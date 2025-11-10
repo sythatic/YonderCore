@@ -1,0 +1,34 @@
+[package]
+name = "yonder_core"
+version = "1.0.0"
+edition = "2021"
+authors = ["Kirika.io"]
+description = "Yonder Maps data processing library"
+
+[lib]
+crate-type = ["staticlib"]  # Static library for iOS linking
+
+[profile.release]
+opt-level = 3           # Maximum optimization
+lto = "fat"             # Link-time optimization
+codegen-units = 1       # Single codegen unit for best optimization
+strip = true            # Strip symbols for smaller binary
+panic = "abort"         # Smaller binary, no unwinding
+overflow-checks = false # Disable overflow checks in release for performance
+debug = false           # No debug info in release
+incremental = false     # Disable incremental compilation for better optimization
+
+[dependencies]
+csv = "1.4.0"         # Fast CSV parsing
+rstar = { version = "0.12", features = ["serde"] }   # R-tree spatial index (better than grid)
+bincode = "2.0.1"     # Fast binary serialization for tile metadata
+serde = { version = "1.0.228", features = ["derive", "rc"] }  # Serialization framework
+
+# GTFS-RT protobuf parsing
+prost = "0.14.1"        # Fast protobuf decoder (no protoc needed at runtime)
+
+# Optional performance improvements to consider:
+# parking_lot = "0.12"  # Faster mutexes than std
+# blake3 = "1.5"        # Fast cryptographic hashing (if you want to upgrade from DefaultHasher)
+# zstd = "0.13"         # Compression for tile data (30-50% size reduction)
+# rkyv = "0.8"          # Zero-copy deserialization (even faster than bincode)
