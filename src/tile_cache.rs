@@ -5,14 +5,16 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use serde::{Serialize, Deserialize};
-use bincode::{Encode, Decode};
+use rkyv::{Archive, Serialize as RkyvSerialize, Deserialize as RkyvDeserialize};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 // MARK: - Core Data Structures
 
 /// Metadata for a cached tile - optimized with smaller types where possible
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Encode, Decode)]
+/// Using rkyv for zero-copy deserialization (much faster than bincode)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+#[rkyv(derive(Debug))]
 pub struct TileMeta {
     /// Unix timestamp (seconds since epoch) when tile expires
     pub expiration: i64,
@@ -175,13 +177,12 @@ struct MemoryCacheEntry {
     last_access: i64,
 }
 
-/// Core tile cache manager - optimized with memory cache and better I/O
+/// Core tile cache manager - optimized with memory cache and rkyv for zero-copy I/O
 pub struct TileCacheCore {
     cache_path: PathBuf,
     statistics: Arc<CacheStatistics>,
     memory_cache: Arc<RwLock<HashMap<String, MemoryCacheEntry>>>,
     max_memory_entries: usize,
-    bincode_config: bincode::config::Configuration,
     // Optional: Store original keys mapped to hashed filenames for debugging
     key_mapping: Arc<RwLock<HashMap<String, String>>>,  // original -> hashed
 }
@@ -199,7 +200,6 @@ impl TileCacheCore {
             statistics: Arc::new(CacheStatistics::new()),
             memory_cache: Arc::new(RwLock::new(HashMap::with_capacity(1000))),
             max_memory_entries: 1000,  // Configurable memory cache size
-            bincode_config: bincode::config::standard(),
             key_mapping: Arc::new(RwLock::new(HashMap::with_capacity(1000))),
         })
     }
@@ -223,11 +223,11 @@ impl TileCacheCore {
             writer.flush()?;
         }
 
-        // Write metadata
-        let meta_bytes = bincode::encode_to_vec(meta, self.bincode_config)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
+        // Serialize metadata with rkyv (zero-copy format)
+        let meta_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("rkyv serialization error: {}", e)))?;
 
-        fs::write(&meta_path, meta_bytes)?;
+        fs::write(&meta_path, &meta_bytes)?;
 
         // Update memory cache
         if let Ok(mut cache) = self.memory_cache.write() {
@@ -261,7 +261,7 @@ impl TileCacheCore {
                     return None;
                 }
 
-                // Update access time and record hit
+                // Update last access time
                 entry.last_access = current_timestamp();
                 self.statistics.record_memory_hit();
 
@@ -272,34 +272,28 @@ impl TileCacheCore {
             }
         }
 
-        // Not in memory, try disk
+        // Not in memory, check disk
         let hashed_key = self.hash_cache_key(cache_key);
         let tile_path = self.tile_path(&hashed_key);
         let meta_path = self.meta_path(&hashed_key);
 
-        // Check if files exist
-        if !tile_path.exists() || !meta_path.exists() {
-            self.statistics.record_cache_miss();
-            return None;
-        }
-
-        // Load metadata and check expiration
+        // Load metadata first to check expiration before reading tile data
         let meta = self.load_metadata_internal(&meta_path)?;
 
         if meta.is_expired() {
             self.statistics.record_expired();
-            // Clean up expired files
-            let _ = fs::remove_file(&tile_path);
-            let _ = fs::remove_file(&meta_path);
+            // Delete expired files
+            let _ = fs::remove_file(tile_path);
+            let _ = fs::remove_file(meta_path);
             return None;
         }
 
         // Load tile data
-        let data = fs::read(&tile_path).ok()?;
+        let data = fs::read(tile_path).ok()?;
 
         self.statistics.record_disk_hit();
 
-        // Update memory cache with the loaded tile
+        // Add to memory cache for faster future access
         if let Ok(mut cache) = self.memory_cache.write() {
             if cache.len() >= self.max_memory_entries {
                 self.evict_lru_from_memory(&mut cache);
@@ -318,37 +312,11 @@ impl TileCacheCore {
         Some(CachedTile { data, meta })
     }
 
-    /// Remove a tile from cache (both memory and disk)
-    pub fn remove_tile(&self, cache_key: &str) -> io::Result<()> {
-        // Remove from memory cache
-        if let Ok(mut cache) = self.memory_cache.write() {
-            cache.remove(cache_key);
-        }
-
-        // Remove from disk
-        let hashed_key = self.hash_cache_key(cache_key);
-        let tile_path = self.tile_path(&hashed_key);
-        let meta_path = self.meta_path(&hashed_key);
-
-        // Attempt to remove both files (ignore errors if files don't exist)
-        let _ = fs::remove_file(&tile_path);
-        let _ = fs::remove_file(&meta_path);
-
-        // Remove from key mapping
-        if let Ok(mut mapping) = self.key_mapping.write() {
-            mapping.retain(|_, v| v != &hashed_key);
-        }
-
-        Ok(())
-    }
-
-    /// Check if a tile exists and is not expired
-    /// NOTE: This now excludes negative cache entries for clearer semantics
+    /// Check if a tile exists and is valid (not expired, not negative cache)
     pub fn is_valid(&self, cache_key: &str) -> bool {
         // Check memory cache first
         if let Ok(cache) = self.memory_cache.read() {
             if let Some(entry) = cache.get(cache_key) {
-                // Valid if not expired AND not a negative cache entry
                 return !entry.meta.is_expired() && !entry.meta.is_negative;
             }
         }
@@ -358,126 +326,13 @@ impl TileCacheCore {
         let meta_path = self.meta_path(&hashed_key);
 
         if let Some(meta) = self.load_metadata_internal(&meta_path) {
-            // Valid if not expired AND not a negative cache entry
-            return !meta.is_expired() && !meta.is_negative;
+            !meta.is_expired() && !meta.is_negative
+        } else {
+            false
         }
-
-        false
     }
 
-    /// Clean up expired tiles from disk and memory
-    pub fn cleanup_expired(&self) -> io::Result<usize> {
-        let mut removed_count = 0;
-
-        // Clean memory cache
-        if let Ok(mut cache) = self.memory_cache.write() {
-            let now = current_timestamp();
-            cache.retain(|_, entry| {
-                if entry.meta.expiration < now {
-                    removed_count += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-        }
-
-        // Clean disk cache
-        for entry in fs::read_dir(&self.cache_path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(ext) = path.extension() {
-                if ext == "meta" {
-                    // Load metadata and check expiration
-                    if let Some(meta) = self.load_metadata_internal(&path) {
-                        if meta.is_expired() {
-                            // Remove both meta and tile files
-                            let _ = fs::remove_file(&path);
-
-                            let mut tile_path = path.clone();
-                            tile_path.set_extension("tile");
-                            let _ = fs::remove_file(&tile_path);
-
-                            removed_count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(removed_count)
-    }
-
-    /// Get total cache size in bytes (disk only)
-    pub fn cache_size(&self) -> io::Result<u64> {
-        let mut total_size = 0u64;
-
-        for entry in fs::read_dir(&self.cache_path)? {
-            let entry = entry?;
-            let metadata = entry.metadata()?;
-
-            if metadata.is_file() {
-                total_size += metadata.len();
-            }
-        }
-
-        Ok(total_size)
-    }
-
-    /// Get number of tiles in cache (memory + disk, deduplicated)
-    pub fn tile_count(&self) -> io::Result<usize> {
-        let mut tile_files = std::collections::HashSet::new();
-
-        // Count disk tiles
-        for entry in fs::read_dir(&self.cache_path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if let Some(ext) = path.extension() {
-                if ext == "tile" {
-                    if let Some(stem) = path.file_stem() {
-                        tile_files.insert(stem.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(tile_files.len())
-    }
-
-    /// Clear all tiles from cache
-    pub fn clear_all(&self) -> io::Result<()> {
-        // Clear memory cache
-        if let Ok(mut cache) = self.memory_cache.write() {
-            cache.clear();
-        }
-
-        // Clear key mapping
-        if let Ok(mut mapping) = self.key_mapping.write() {
-            mapping.clear();
-        }
-
-        // Clear disk cache
-        for entry in fs::read_dir(&self.cache_path)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() {
-                fs::remove_file(path)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Save a negative cache entry (404, no data)
-    pub fn save_negative_cache(&self, cache_key: &str, ttl_seconds: i64) -> io::Result<()> {
-        let meta = TileMeta::new_negative(ttl_seconds);
-        self.save_tile(cache_key, &[], &meta)
-    }
-
-    /// Check if an entry is a negative cache entry
+    /// Check if a tile is a negative cache entry (404)
     pub fn is_negative_cache(&self, cache_key: &str) -> bool {
         // Check memory cache first
         if let Ok(cache) = self.memory_cache.read() {
@@ -491,44 +346,189 @@ impl TileCacheCore {
         let meta_path = self.meta_path(&hashed_key);
 
         if let Some(meta) = self.load_metadata_internal(&meta_path) {
-            return meta.is_negative && !meta.is_expired();
+            meta.is_negative && !meta.is_expired()
+        } else {
+            false
+        }
+    }
+
+    /// Save a negative cache entry (e.g., for 404 responses)
+    pub fn save_negative_cache(&self, cache_key: &str, expiration_secs: i64) -> io::Result<()> {
+        let meta = TileMeta::new_negative(expiration_secs);
+        let hashed_key = self.hash_cache_key(cache_key);
+        let meta_path = self.meta_path(&hashed_key);
+
+        // Store the mapping for debugging
+        if let Ok(mut mapping) = self.key_mapping.write() {
+            mapping.insert(cache_key.to_string(), hashed_key);
         }
 
-        false
+        // Serialize metadata with rkyv
+        let meta_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("rkyv serialization error: {}", e)))?;
+
+        fs::write(&meta_path, &meta_bytes)?;
+
+        // Update memory cache with empty data
+        if let Ok(mut cache) = self.memory_cache.write() {
+            if cache.len() >= self.max_memory_entries {
+                self.evict_lru_from_memory(&mut cache);
+            }
+
+            cache.insert(
+                cache_key.to_string(),
+                MemoryCacheEntry {
+                    data: Arc::new(Vec::new()),
+                    meta,
+                    last_access: current_timestamp(),
+                },
+            );
+        }
+
+        Ok(())
     }
 
-    // MARK: - Statistics Methods
+    /// Delete a specific tile from cache
+    pub fn delete_tile(&self, cache_key: &str) -> io::Result<()> {
+        // Remove from memory cache
+        if let Ok(mut cache) = self.memory_cache.write() {
+            cache.remove(cache_key);
+        }
 
-    pub fn record_memory_hit(&self) {
-        self.statistics.record_memory_hit();
+        // Remove from disk
+        let hashed_key = self.hash_cache_key(cache_key);
+        let tile_path = self.tile_path(&hashed_key);
+        let meta_path = self.meta_path(&hashed_key);
+
+        // Try to remove both files (ignore errors if they don't exist)
+        let _ = fs::remove_file(tile_path);
+        let _ = fs::remove_file(meta_path);
+
+        // Remove from key mapping
+        if let Ok(mut mapping) = self.key_mapping.write() {
+            mapping.remove(cache_key);
+        }
+
+        Ok(())
     }
 
-    pub fn record_network_fetch(&self) {
-        self.statistics.record_network_fetch();
+    /// Clear all cached tiles
+    pub fn clear_all(&self) -> io::Result<()> {
+        // Clear memory cache
+        if let Ok(mut cache) = self.memory_cache.write() {
+            cache.clear();
+        }
+
+        // Clear key mapping
+        if let Ok(mut mapping) = self.key_mapping.write() {
+            mapping.clear();
+        }
+
+        // Delete all files in cache directory
+        if self.cache_path.exists() {
+            for entry in fs::read_dir(&self.cache_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    fs::remove_file(path)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    pub fn record_cache_miss(&self) {
-        self.statistics.record_cache_miss();
+    /// Clear expired tiles from disk and memory
+    pub fn clear_expired(&self) -> io::Result<u64> {
+        let mut cleared_count = 0u64;
+
+        // Clear from memory cache
+        if let Ok(mut cache) = self.memory_cache.write() {
+            let now = current_timestamp();
+            cache.retain(|_, entry| {
+                let expired = entry.meta.expiration < now;
+                if expired {
+                    cleared_count += 1;
+                }
+                !expired
+            });
+        }
+
+        // Clear from disk
+        if self.cache_path.exists() {
+            for entry in fs::read_dir(&self.cache_path)? {
+                let entry = entry?;
+                let path = entry.path();
+
+                // Only process .meta files
+                if path.extension().and_then(|s| s.to_str()) == Some("meta") {
+                    if let Some(meta) = self.load_metadata_internal(&path) {
+                        if meta.is_expired() {
+                            // Delete both .meta and .tile files
+                            let stem = path.file_stem().unwrap();
+                            let tile_path = self.cache_path.join(format!("{}.tile", stem.to_string_lossy()));
+
+                            let _ = fs::remove_file(&path);
+                            let _ = fs::remove_file(tile_path);
+                            cleared_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(cleared_count)
     }
 
+    /// Get total number of cached tiles on disk
+    pub fn tile_count(&self) -> io::Result<usize> {
+        let mut count = 0;
+        if self.cache_path.exists() {
+            for entry in fs::read_dir(&self.cache_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("tile") {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Get total cache size on disk in bytes
+    pub fn cache_size(&self) -> io::Result<u64> {
+        let mut total_size = 0u64;
+        if self.cache_path.exists() {
+            for entry in fs::read_dir(&self.cache_path)? {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                if metadata.is_file() {
+                    total_size += metadata.len();
+                }
+            }
+        }
+        Ok(total_size)
+    }
+
+    /// Get cache statistics
     pub fn statistics(&self) -> CacheStatsSnapshot {
         self.statistics.snapshot()
     }
 
+    /// Reset statistics counters
     pub fn reset_statistics(&self) {
         self.statistics.reset();
     }
 
-    // MARK: - LRU Eviction
-
+    /// Evict least recently used entry from memory cache
     fn evict_lru_from_memory(&self, cache: &mut HashMap<String, MemoryCacheEntry>) {
         if cache.is_empty() {
             return;
         }
 
-        // Find the least recently accessed entry
-        let mut oldest_key = None;
+        // Find the entry with the oldest access time
         let mut oldest_time = i64::MAX;
+        let mut oldest_key: Option<String> = None;
 
         for (key, entry) in cache.iter() {
             if entry.last_access < oldest_time {
@@ -571,9 +571,18 @@ impl TileCacheCore {
 
     fn load_metadata_internal(&self, meta_path: &Path) -> Option<TileMeta> {
         let data = fs::read(meta_path).ok()?;
-        let (meta, _): (TileMeta, usize) =
-            bincode::decode_from_slice(&data, self.bincode_config).ok()?;
-        Some(meta)
+
+        // Zero-copy deserialization with rkyv using the correct archived type
+        let archived = rkyv::access::<ArchivedTileMeta, rkyv::rancor::Error>(&data).ok()?;
+
+        // Copy fields from archived data (very cheap - just copying primitive types)
+        Some(TileMeta {
+            expiration: archived.expiration.into(),
+            download_time: archived.download_time.into(),
+            data_size: archived.data_size.into(),
+            http_status: archived.http_status.into(),
+            is_negative: archived.is_negative.into(),
+        })
     }
 
     /// Get memory cache stats for monitoring
@@ -604,6 +613,38 @@ impl TileCacheCore {
         } else {
             None
         }
+    }
+
+    // MARK: - Statistics Recording Methods (for API compatibility)
+
+    /// Record a memory cache hit
+    #[inline(always)]
+    pub fn record_memory_hit(&self) {
+        self.statistics.record_memory_hit();
+    }
+
+    /// Record a disk cache hit
+    #[inline(always)]
+    pub fn record_disk_hit(&self) {
+        self.statistics.record_disk_hit();
+    }
+
+    /// Record a network fetch
+    #[inline(always)]
+    pub fn record_network_fetch(&self) {
+        self.statistics.record_network_fetch();
+    }
+
+    /// Record a cache miss
+    #[inline(always)]
+    pub fn record_cache_miss(&self) {
+        self.statistics.record_cache_miss();
+    }
+
+    /// Record an expired tile
+    #[inline(always)]
+    pub fn record_expired(&self) {
+        self.statistics.record_expired();
     }
 }
 
@@ -785,6 +826,33 @@ mod tests {
 
         // But negative cache should still be recognized as negative
         assert!(cache.is_negative_cache("negative_tile"));
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_rkyv_serialization() {
+        let temp_dir = std::env::temp_dir().join("test_rkyv");
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let cache = TileCacheCore::new(temp_dir.clone()).unwrap();
+
+        // Create metadata
+        let meta = TileMeta::new_success(3600, 4096);
+
+        // Save some data with metadata
+        let data = b"rkyv test data";
+        cache.save_tile("rkyv_test", data, &meta).unwrap();
+
+        // Load it back
+        let loaded = cache.load_tile("rkyv_test").unwrap();
+
+        // Verify all fields match
+        assert_eq!(loaded.meta.data_size, meta.data_size);
+        assert_eq!(loaded.meta.http_status, meta.http_status);
+        assert_eq!(loaded.meta.is_negative, meta.is_negative);
+        assert_eq!(loaded.data, data);
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);

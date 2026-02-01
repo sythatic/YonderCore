@@ -9,7 +9,6 @@ use rstar::{RTree, AABB, primitives::GeomWithData};
 
 mod tile_cache;
 mod gtfs_rt;
-mod build;
 
 pub use tile_cache::*;
 pub use gtfs_rt::*;
@@ -694,7 +693,7 @@ pub extern "C" fn tile_cache_remove(
             Err(_) => return 0,
         };
 
-        match cache.remove_tile(key_str) {
+        match cache.delete_tile(key_str) {
             Ok(_) => 1,
             Err(_) => 0,
         }
@@ -732,7 +731,8 @@ pub extern "C" fn tile_cache_cleanup_expired(cache: *mut TileCacheCore) -> usize
 
     unsafe {
         let cache = &*cache;
-        cache.cleanup_expired().unwrap_or(0)
+        cache.clear_expired().unwrap_or(0)
+        as usize
     }
 }
 
