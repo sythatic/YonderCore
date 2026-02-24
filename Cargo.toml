@@ -1,6 +1,6 @@
 [package]
 name = "yonder_core"
-version = "1.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Kirika.io"]
 description = "Yonder Maps data processing library"
@@ -23,6 +23,4 @@ csv = "1.4.0"         # Fast CSV parsing
 rstar = { version = "0.12.2", features = ["serde"] }   # R-tree spatial index (better than grid)
 serde = { version = "1.0.228", features = ["derive", "rc"] }  # Serialization framework
 prost = "0.14.3"
-rkyv = "0.8.14"
-fnv = "1.0.7"
-parking_lot = "0.12.5"  # Faster locks without poison — no lock-poisoning on panic
+rkyv = "0.8.15"

@@ -100,10 +100,6 @@ pub struct Alert {
     pub active_period: Vec<TimeRange>,
     #[prost(message, repeated, tag = "5")]
     pub informed_entity: Vec<EntitySelector>,
-    #[prost(enumeration = "AlertCause", optional, tag = "6")]
-    pub cause: Option<i32>,
-    #[prost(enumeration = "AlertEffect", optional, tag = "7")]
-    pub effect: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -215,71 +211,40 @@ pub enum OccupancyStatus {
     NotAcceptingPassengers = 6,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
-#[repr(i32)]
-pub enum AlertCause {
-    UnknownCause = 0,
-    OtherCause = 1,
-    TechnicalProblem = 2,
-    Strike = 3,
-    Demonstration = 4,
-    Accident = 5,
-    Holiday = 6,
-    Weather = 7,
-    Maintenance = 8,
-    Construction = 9,
-    PoliceActivity = 10,
-    MedicalEmergency = 11,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
-#[repr(i32)]
-pub enum AlertEffect {
-    NoService = 1,
-    ReducedService = 2,
-    SignificantDelays = 3,
-    Detour = 4,
-    AdditionalService = 5,
-    ModifiedService = 6,
-    OtherEffect = 7,
-    UnknownEffect = 8,
-    StopMoved = 9,
-}
-
 // MARK: - Simplified structs for FFI
-//
-// FFIVehicle is a safe Rust-side struct. It is converted to CVehicle only at
-// the FFI boundary (in lib.rs), ensuring Rust owns the strings until freed.
 
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FFIVehicle {
-    pub id: String,
+    pub id: *const c_char,
     pub latitude: f64,
     pub longitude: f64,
     pub bearing: f32,
     pub speed: f32,
-    pub route_id: Option<String>,
-    pub trip_id: Option<String>,
+    pub route_id: *const c_char,
+    pub trip_id: *const c_char,
     pub timestamp: i64,
     pub has_bearing: bool,
     pub has_speed: bool,
     pub occupancy_status: i32,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FFITripUpdate {
-    pub trip_id: Option<String>,
-    pub route_id: Option<String>,
-    pub vehicle_id: Option<String>,
+    pub trip_id: *const c_char,
+    pub route_id: *const c_char,
+    pub vehicle_id: *const c_char,
     pub timestamp: i64,
     pub delay: i32,
     pub has_delay: bool,
     pub stop_time_updates_count: usize,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FFIStopTimeUpdate {
-    pub stop_id: Option<String>,
+    pub stop_id: *const c_char,
     pub stop_sequence: u32,
     pub arrival_delay: i32,
     pub arrival_time: i64,
@@ -289,90 +254,10 @@ pub struct FFIStopTimeUpdate {
     pub has_departure: bool,
 }
 
-/// C-compatible vehicle struct with owned string pointers — only constructed at the FFI boundary.
-///
-/// Field types match YonderCore.h exactly:
-///   - id/route_id/trip_id are `*mut c_char` (owned by Rust, freed via gtfs_rt_free_vehicles)
-///   - numeric fields match their C counterparts
-///
-/// The caller MUST free the whole array with gtfs_rt_free_vehicles(ptr, count).
-/// Individual fields must NEVER be freed by the C/Swift side directly.
-#[repr(C)]
-pub struct CVehicle {
-    /// Owned UTF-8 C string. Never null.
-    pub id: *mut c_char,
-    pub latitude: f64,
-    pub longitude: f64,
-    pub bearing: f32,
-    pub speed: f32,
-    /// Owned UTF-8 C string, or NULL if not present.
-    pub route_id: *mut c_char,
-    /// Owned UTF-8 C string, or NULL if not present.
-    pub trip_id: *mut c_char,
-    pub timestamp: i64,
-    pub has_bearing: bool,
-    pub has_speed: bool,
-    pub occupancy_status: i32,
-}
-
-impl CVehicle {
-    /// Convert a safe FFIVehicle into a C-compatible struct.
-    /// The returned struct owns its strings via CString::into_raw().
-    /// Must be consumed with CVehicle::free_owned() to avoid leaks.
-    pub fn from_ffi(v: FFIVehicle) -> Self {
-        let id = CString::new(v.id).unwrap_or_default().into_raw();
-        let route_id = v.route_id
-            .and_then(|s| CString::new(s).ok())
-            .map(|s| s.into_raw())
-            .unwrap_or(std::ptr::null_mut());
-        let trip_id = v.trip_id
-            .and_then(|s| CString::new(s).ok())
-            .map(|s| s.into_raw())
-            .unwrap_or(std::ptr::null_mut());
-
-        CVehicle {
-            id,
-            latitude: v.latitude,
-            longitude: v.longitude,
-            bearing: v.bearing,
-            speed: v.speed,
-            route_id,
-            trip_id,
-            timestamp: v.timestamp,
-            has_bearing: v.has_bearing,
-            has_speed: v.has_speed,
-            occupancy_status: v.occupancy_status,
-        }
-    }
-
-    /// Consume this struct and free all owned string pointers.
-    ///
-    /// Takes `self` by value (not `&self`) so it is impossible to call twice —
-    /// the compiler enforces single-use, preventing double-free.
-    ///
-    /// # Safety
-    /// All non-null pointer fields must have been produced by CString::into_raw().
-    pub unsafe fn free_owned(self) {
-        if !self.id.is_null() {
-            drop(CString::from_raw(self.id));
-        }
-        if !self.route_id.is_null() {
-            drop(CString::from_raw(self.route_id));
-        }
-        if !self.trip_id.is_null() {
-            drop(CString::from_raw(self.trip_id));
-        }
-        // The struct itself is dropped at the end of this scope.
-    }
-}
-
 // MARK: - GTFS-RT Manager
 
 pub struct GtfsRtManager {
     vehicles: Vec<VehiclePosition>,
-    /// Entity-level IDs parallel to `vehicles` — used as fallback when the
-    /// nested VehicleDescriptor has no id field.
-    vehicle_entity_ids: Vec<String>,
     trip_updates: Vec<TripUpdate>,
     alerts: Vec<Alert>,
     last_update: Option<u64>,
@@ -382,7 +267,6 @@ impl GtfsRtManager {
     pub fn new() -> Self {
         Self {
             vehicles: Vec::new(),
-            vehicle_entity_ids: Vec::new(),
             trip_updates: Vec::new(),
             alerts: Vec::new(),
             last_update: None,
@@ -396,7 +280,6 @@ impl GtfsRtManager {
 
         // Clear existing data
         self.vehicles.clear();
-        self.vehicle_entity_ids.clear();
         self.trip_updates.clear();
         self.alerts.clear();
 
@@ -406,7 +289,6 @@ impl GtfsRtManager {
         // Extract entities
         for entity in feed.entity {
             if let Some(vehicle) = entity.vehicle {
-                self.vehicle_entity_ids.push(entity.id.clone());
                 self.vehicles.push(vehicle);
             }
             if let Some(trip_update) = entity.trip_update {
@@ -424,8 +306,7 @@ impl GtfsRtManager {
     pub fn get_vehicles(&self) -> Vec<FFIVehicle> {
         self.vehicles
             .iter()
-            .zip(self.vehicle_entity_ids.iter())
-            .filter_map(|(v, entity_id)| self.vehicle_to_ffi(v, entity_id))
+            .filter_map(|v| self.vehicle_to_ffi(v))
             .collect()
     }
 
@@ -439,14 +320,13 @@ impl GtfsRtManager {
     ) -> Vec<FFIVehicle> {
         self.vehicles
             .iter()
-            .zip(self.vehicle_entity_ids.iter())
-            .filter_map(|(v, entity_id)| {
+            .filter_map(|v| {
                 let pos = v.position.as_ref()?;
                 let lat = pos.latitude as f64;
                 let lon = pos.longitude as f64;
 
                 if lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon {
-                    self.vehicle_to_ffi(v, entity_id)
+                    self.vehicle_to_ffi(v)
                 } else {
                     None
                 }
@@ -480,42 +360,38 @@ impl GtfsRtManager {
         self.trip_updates.len()
     }
 
-    /// Convert VehiclePosition to safe FFI struct.
-    /// entity_id is used as fallback if no nested vehicle descriptor id.
-    fn vehicle_to_ffi(&self, vehicle: &VehiclePosition, entity_id: &str) -> Option<FFIVehicle> {
+    /// Convert VehiclePosition to FFI struct
+    fn vehicle_to_ffi(&self, vehicle: &VehiclePosition) -> Option<FFIVehicle> {
         let pos = vehicle.position.as_ref()?;
 
-        // Prefer vehicle.vehicle.id, fall back to the feed entity id
+        // Get vehicle ID (prefer vehicle.vehicle.id, fallback to entity ID stored elsewhere)
         let id = vehicle
             .vehicle
             .as_ref()
-            .and_then(|v| v.id.as_deref())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(entity_id)
-            .to_string();
-
-        if id.is_empty() {
-            return None;
-        }
+            .and_then(|v| v.id.as_ref())
+            .map(|s| CString::new(s.as_str()).ok())
+            .flatten()?;
 
         let route_id = vehicle
             .trip
             .as_ref()
-            .and_then(|t| t.route_id.clone());
+            .and_then(|t| t.route_id.as_ref())
+            .and_then(|s| CString::new(s.as_str()).ok());
 
         let trip_id = vehicle
             .trip
             .as_ref()
-            .and_then(|t| t.trip_id.clone());
+            .and_then(|t| t.trip_id.as_ref())
+            .and_then(|s| CString::new(s.as_str()).ok());
 
         Some(FFIVehicle {
-            id,
+            id: id.into_raw(),
             latitude: pos.latitude as f64,
             longitude: pos.longitude as f64,
             bearing: pos.bearing.unwrap_or(0.0),
             speed: pos.speed.unwrap_or(0.0),
-            route_id,
-            trip_id,
+            route_id: route_id.map_or(std::ptr::null(), |s| s.into_raw()),
+            trip_id: trip_id.map_or(std::ptr::null(), |s| s.into_raw()),
             timestamp: vehicle.timestamp.unwrap_or(0) as i64,
             has_bearing: pos.bearing.is_some(),
             has_speed: pos.speed.is_some(),
@@ -525,33 +401,38 @@ impl GtfsRtManager {
 }
 
 // MARK: - Thread-safe wrapper
-//
-// Uses parking_lot::RwLock instead of std::sync::RwLock:
-//   - No lock poisoning: a panic in one thread doesn't permanently break the lock
-//   - Faster: smaller overhead on the uncontended path
-//   - GTFS-RT is read-heavy (many callers querying vehicles between parses),
-//     so allowing concurrent readers improves throughput.
 
 pub struct GtfsRtCore {
-    manager: parking_lot::RwLock<GtfsRtManager>,
+    manager: std::sync::Mutex<GtfsRtManager>,
 }
 
 impl GtfsRtCore {
     pub fn new() -> Self {
         Self {
-            manager: parking_lot::RwLock::new(GtfsRtManager::new()),
+            manager: std::sync::Mutex::new(GtfsRtManager::new()),
         }
     }
 
     pub fn parse(&self, data: &[u8]) -> Result<(), String> {
-        self.manager.write().parse_feed(data)
+        self.manager
+            .lock()
+            .map_err(|_| "Failed to acquire lock".to_string())?
+            .parse_feed(data)
     }
 
     pub fn get_vehicles(&self) -> Result<Vec<FFIVehicle>, String> {
-        Ok(self.manager.read().get_vehicles())
+        Ok(self
+            .manager
+            .lock()
+            .map_err(|_| "Failed to acquire lock".to_string())?
+            .get_vehicles())
     }
 
     pub fn vehicle_count(&self) -> Result<usize, String> {
-        Ok(self.manager.read().vehicle_count())
+        Ok(self
+            .manager
+            .lock()
+            .map_err(|_| "Failed to acquire lock".to_string())?
+            .vehicle_count())
     }
 }
