@@ -223,6 +223,7 @@ pub struct FFIVehicle {
     pub speed: f32,
     pub route_id: *const c_char,
     pub trip_id: *const c_char,
+    pub label: *const c_char,   // VehicleDescriptor.label — human-readable name
     pub timestamp: i64,
     pub has_bearing: bool,
     pub has_speed: bool,
@@ -364,13 +365,20 @@ impl GtfsRtManager {
     fn vehicle_to_ffi(&self, vehicle: &VehiclePosition) -> Option<FFIVehicle> {
         let pos = vehicle.position.as_ref()?;
 
-        // Get vehicle ID (prefer vehicle.vehicle.id, fallback to entity ID stored elsewhere)
-        let id = vehicle
+        // vehicle.vehicle.id is the machine ID; fall back to label if absent
+        let id_str = vehicle
             .vehicle
             .as_ref()
-            .and_then(|v| v.id.as_ref())
-            .map(|s| CString::new(s.as_str()).ok())
-            .flatten()?;
+            .and_then(|v| v.id.as_deref().or(v.label.as_deref()))
+            .unwrap_or("unknown");
+        let id = CString::new(id_str).ok()?;
+
+        // VehicleDescriptor.label — Amtrak uses this for the human-readable train number/name
+        let label = vehicle
+            .vehicle
+            .as_ref()
+            .and_then(|v| v.label.as_ref())
+            .and_then(|s| CString::new(s.as_str()).ok());
 
         let route_id = vehicle
             .trip
@@ -392,6 +400,7 @@ impl GtfsRtManager {
             speed: pos.speed.unwrap_or(0.0),
             route_id: route_id.map_or(std::ptr::null(), |s| s.into_raw()),
             trip_id: trip_id.map_or(std::ptr::null(), |s| s.into_raw()),
+            label: label.map_or(std::ptr::null(), |s| s.into_raw()),
             timestamp: vehicle.timestamp.unwrap_or(0) as i64,
             has_bearing: pos.bearing.is_some(),
             has_speed: pos.speed.is_some(),

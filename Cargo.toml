@@ -24,3 +24,4 @@ rstar = { version = "0.12.2", features = ["serde"] }   # R-tree spatial index (b
 serde = { version = "1.0.228", features = ["derive", "rc"] }  # Serialization framework
 prost = "0.14.3"
 rkyv = "0.8.15"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }  # Pure-Rust deflate, no C deps

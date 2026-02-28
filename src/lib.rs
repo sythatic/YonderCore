@@ -9,9 +9,11 @@ use rstar::{RTree, AABB, primitives::GeomWithData};
 
 mod tile_cache;
 mod gtfs_rt;
+mod gtfs_static;
 
 pub use tile_cache::*;
 pub use gtfs_rt::*;
+pub use gtfs_static::*;
 
 // MARK: - Core Data Structures
 
@@ -732,7 +734,7 @@ pub extern "C" fn tile_cache_cleanup_expired(cache: *mut TileCacheCore) -> usize
     unsafe {
         let cache = &*cache;
         cache.clear_expired().unwrap_or(0)
-        as usize
+            as usize
     }
 }
 

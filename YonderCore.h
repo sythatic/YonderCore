@@ -86,4 +86,44 @@ void gtfs_rt_free_vehicles(FFIVehicle* vehicles, size_t count);
 /// Free GTFS-RT manager
 void gtfs_rt_free(GtfsRtCore* core);
 
+
+// MARK: - GTFS Static Lookup
+
+/// One HTTP byte-range Swift must fetch from the ZIP.
+typedef struct {
+    const char* filename;   // "trips.txt" or "routes.txt"
+    uint64_t    byte_offset;
+    uint64_t    byte_length;
+} GTFSZipRange;
+
+/// Result of a static lookup. Both pointers may be NULL.
+typedef struct {
+    const char* train_number;  // e.g. "168"
+    const char* route_name;    // e.g. "Northeast Regional"
+} GTFSStaticResult;
+
+/// Feed the last ~65 KB of the ZIP to parse the central directory.
+/// Returns an array of ranges to fetch; sets *out_count.
+/// Free with gtfs_static_free_ranges().
+GTFSZipRange* gtfs_static_feed_eocd(const uint8_t* data, size_t data_len, size_t* out_count);
+
+/// Feed decompressed bytes for "trips.txt" or "routes.txt" (starting at local header).
+/// Returns 0 on success, -1 on error.
+int32_t gtfs_static_feed_file(const char* filename, const uint8_t* data, size_t data_len);
+
+/// Look up a realtime trip_id. Always returns non-null; free with gtfs_static_free_result().
+GTFSStaticResult* gtfs_static_lookup(const char* trip_id);
+
+/// Free result from gtfs_static_lookup.
+void gtfs_static_free_result(GTFSStaticResult* result);
+
+/// Free range array from gtfs_static_feed_eocd.
+void gtfs_static_free_ranges(GTFSZipRange* ranges, size_t count);
+
+/// Returns 1 if static data is fully loaded.
+int32_t gtfs_static_is_loaded(void);
+
+/// Clear all loaded static data.
+void gtfs_static_reset(void);
+
 #endif /* YonderCore_h */
