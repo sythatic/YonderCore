@@ -444,4 +444,92 @@ impl GtfsRtCore {
             .map_err(|_| "Failed to acquire lock".to_string())?
             .vehicle_count())
     }
+
+    /// Look up trip update data for a specific trip_id.
+    /// Returns None if no matching TripUpdate exists.
+    pub fn get_trip_update(&self, trip_id: &str) -> Result<Option<TripUpdateSummary>, String> {
+        let mgr = self
+            .manager
+            .lock()
+            .map_err(|_| "Failed to acquire lock".to_string())?;
+
+        // Normalise trip_id the same way gtfs_static does:
+        // "2026-02-27_AMTK_3" → try exact first, then last underscore token.
+        let tu = mgr.find_trip_update(trip_id).or_else(|| {
+            if trip_id.contains('_') {
+                trip_id.split('_').last().and_then(|t| mgr.find_trip_update(t))
+            } else {
+                None
+            }
+        });
+
+        let Some(tu) = tu else {
+            return Ok(None);
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Next stop = first StopTimeUpdate with a future departure or arrival time.
+        let next = tu.stop_time_update.iter().find(|stu| {
+            let t = stu
+                .departure.as_ref().and_then(|e| e.time)
+                .or_else(|| stu.arrival.as_ref().and_then(|e| e.time));
+            t.map(|ts| ts > now).unwrap_or(false)
+        });
+
+        // Amtrak does not populate TripUpdate.delay — derive it from stop-level events.
+        // Priority: (1) top-level trip delay, (2) next stop's delay,
+        // (3) most recent past stop's delay.
+        let stu_delay = |stu: &StopTimeUpdate| -> Option<i32> {
+            stu.arrival.as_ref().and_then(|e| e.delay)
+                .or_else(|| stu.departure.as_ref().and_then(|e| e.delay))
+        };
+        let delay_seconds: Option<i32> = tu.delay
+            .or_else(|| next.and_then(stu_delay))
+            .or_else(|| {
+                // Fall back to most recent past stop (last one before now)
+                tu.stop_time_update.iter().rev().find(|stu| {
+                    let t = stu.departure.as_ref().and_then(|e| e.time)
+                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.time));
+                    t.map(|ts| ts <= now).unwrap_or(false)
+                })
+                    .and_then(stu_delay)
+            });
+        let has_delay = delay_seconds.is_some();
+
+        let next_stop_id = next
+            .and_then(|s| s.stop_id.as_ref())
+            .and_then(|s| CString::new(s.as_str()).ok());
+
+        let next_arrival_time = next
+            .and_then(|s| s.arrival.as_ref().and_then(|e| e.time))
+            .unwrap_or(0);
+
+        Ok(Some(TripUpdateSummary {
+            delay_seconds: delay_seconds.unwrap_or(0),
+            has_delay,
+            next_stop_id: next_stop_id.map_or(std::ptr::null(), |s| s.into_raw()),
+            next_arrival_time,
+            has_next_stop: next.is_some(),
+        }))
+    }
+}
+
+/// Flat summary of a TripUpdate for FFI — avoids exposing arrays across the boundary.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct TripUpdateSummary {
+    /// Overall trip delay in seconds (positive = late, negative = early).
+    pub delay_seconds: i32,
+    /// True if `delay_seconds` is meaningful.
+    pub has_delay: bool,
+    /// C string of the next upcoming stop_id, or null.
+    pub next_stop_id: *const c_char,
+    /// Unix timestamp of the predicted arrival at `next_stop_id` (0 = unknown).
+    pub next_arrival_time: i64,
+    /// True if `next_stop_id` and `next_arrival_time` are populated.
+    pub has_next_stop: bool,
 }

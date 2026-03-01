@@ -1038,3 +1038,46 @@ pub extern "C" fn gtfs_rt_free(core: *mut GtfsRtCore) {
         }
     }
 }
+
+/// Look up trip update data for a given trip_id.
+/// Returns a heap-allocated TripUpdateSummary on success, or null if not found.
+/// Free with gtfs_rt_free_trip_update().
+#[no_mangle]
+pub extern "C" fn gtfs_rt_get_trip_update(
+    core: *const GtfsRtCore,
+    trip_id: *const c_char,
+) -> *mut TripUpdateSummary {
+    if core.is_null() || trip_id.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        let core = &*core;
+        // Use CStr (no underscore) as imported on line 1
+        let trip_id_str = match CStr::from_ptr(trip_id).to_str() {
+            Ok(s) => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+
+        match core.get_trip_update(trip_id_str) {
+            Ok(Some(summary)) => Box::into_raw(Box::new(summary)),
+            _ => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Free a TripUpdateSummary returned by gtfs_rt_get_trip_update.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_free_trip_update(summary: *mut TripUpdateSummary) {
+    if summary.is_null() {
+        return;
+    }
+
+    unsafe {
+        let s = &*summary;
+        if !s.next_stop_id.is_null() {
+            let _ = CString::from_raw(s.next_stop_id as *mut c_char);
+        }
+        let _ = Box::from_raw(summary);
+    }
+}

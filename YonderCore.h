@@ -14,17 +14,18 @@ typedef struct GtfsRtCore GtfsRtCore;
 // MARK: - GTFS-RT Structures
 
 typedef struct {
-    const char* id;
-    double latitude;
-    double longitude;
-    float bearing;
-    float speed;
-    const char* route_id;
-    const char* trip_id;
-    int64_t timestamp;
-    bool has_bearing;
-    bool has_speed;
-    int32_t occupancy_status;
+	const char* id;
+	double latitude;
+	double longitude;
+	float bearing;
+	float speed;
+	const char* route_id;
+	const char* trip_id;
+	const char* label;      // ← this line
+	int64_t timestamp;
+	bool has_bearing;
+	bool has_speed;
+	int32_t occupancy_status;
 } FFIVehicle;
 
 // MARK: - Test Functions
@@ -85,6 +86,26 @@ void gtfs_rt_free_vehicles(FFIVehicle* vehicles, size_t count);
 
 /// Free GTFS-RT manager
 void gtfs_rt_free(GtfsRtCore* core);
+
+// MARK: - GTFS-RT Trip Update Lookup
+
+/// Flat summary of a TripUpdate for a single trip.
+/// Returned by gtfs_rt_get_trip_update(); free with gtfs_rt_free_trip_update().
+typedef struct {
+    int32_t  delay_seconds;      // overall trip delay (positive = late, negative = early)
+    bool     has_delay;          // true if delay_seconds is meaningful
+    const char* next_stop_id;    // stop_id of the next upcoming stop, or NULL
+    int64_t  next_arrival_time;  // unix timestamp of predicted arrival at next_stop_id (0 = unknown)
+    bool     has_next_stop;      // true if next_stop_id and next_arrival_time are populated
+} TripUpdateSummary;
+
+/// Look up trip update data for a given trip_id.
+/// Returns a heap-allocated TripUpdateSummary, or NULL if no matching TripUpdate exists.
+/// Caller must free the result with gtfs_rt_free_trip_update().
+TripUpdateSummary* gtfs_rt_get_trip_update(const GtfsRtCore* core, const char* trip_id);
+
+/// Free a TripUpdateSummary returned by gtfs_rt_get_trip_update.
+void gtfs_rt_free_trip_update(TripUpdateSummary* summary);
 
 
 // MARK: - GTFS Static Lookup
