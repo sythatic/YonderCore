@@ -2,7 +2,8 @@ use prost::Message;
 use std::ffi::{CString, c_char};
 
 // MARK: - Protobuf Message Definitions
-// These match the official GTFS-RT specification
+// Matches the official GTFS-RT spec:
+// https://raw.githubusercontent.com/google/transit/refs/heads/master/gtfs-realtime/proto/gtfs-realtime.proto
 
 #[derive(Clone, PartialEq, Message)]
 pub struct FeedMessage {
@@ -20,6 +21,9 @@ pub struct FeedHeader {
     pub incrementality: Option<i32>,
     #[prost(uint64, optional, tag = "3")]
     pub timestamp: Option<u64>,
+    // Field 4: feed_version — useful for detecting static GTFS updates
+    #[prost(string, optional, tag = "4")]
+    pub feed_version: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -34,6 +38,15 @@ pub struct FeedEntity {
     pub vehicle: Option<VehiclePosition>,
     #[prost(message, optional, tag = "5")]
     pub alert: Option<Alert>,
+    // Fields 6–8 (shape, stop, trip_modifications) are experimental and
+    // intentionally omitted; prost drops unknown fields gracefully.
+    //
+    // TripModifications (field 8) — add when detour/route-change support is needed:
+    //   #[prost(message, optional, tag = "8")]
+    //   pub trip_modifications: Option<TripModifications>,
+    // See the GTFS-RT spec for the TripModifications message definition.
+    // The GtfsRtManager::parse_feed loop will need a corresponding branch
+    // to collect and expose modifications alongside trip_updates.
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -46,6 +59,8 @@ pub struct TripUpdate {
     pub stop_time_update: Vec<StopTimeUpdate>,
     #[prost(uint64, optional, tag = "4")]
     pub timestamp: Option<u64>,
+    // Field 5: trip-level delay in seconds. Experimental per spec; rarely
+    // populated by Amtrak. Per-stop delay in StopTimeEvent is more reliable.
     #[prost(int32, optional, tag = "5")]
     pub delay: Option<i32>,
 }
@@ -60,6 +75,19 @@ pub struct StopTimeUpdate {
     pub arrival: Option<StopTimeEvent>,
     #[prost(message, optional, tag = "3")]
     pub departure: Option<StopTimeEvent>,
+    // Field 5: per-stop schedule relationship.
+    // 0=SCHEDULED, 1=SKIPPED, 2=NO_DATA, 3=UNSCHEDULED
+    // Required to filter skipped stops from the next-stop finder.
+    #[prost(int32, optional, tag = "5")]
+    pub schedule_relationship: Option<i32>,
+}
+
+/// Per-stop schedule relationship values for StopTimeUpdate (field 5).
+pub mod stop_time_schedule_relationship {
+    pub const SCHEDULED: i32 = 0;
+    pub const SKIPPED: i32 = 1;
+    pub const NO_DATA: i32 = 2;
+    pub const UNSCHEDULED: i32 = 3;
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -70,6 +98,9 @@ pub struct StopTimeEvent {
     pub time: Option<i64>,
     #[prost(int32, optional, tag = "3")]
     pub uncertainty: Option<i32>,
+    // Field 4: scheduled_time — for NEW/REPLACEMENT/DUPLICATED trips (experimental)
+    #[prost(int64, optional, tag = "4")]
+    pub scheduled_time: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -92,6 +123,9 @@ pub struct VehiclePosition {
     pub congestion_level: Option<i32>,
     #[prost(enumeration = "OccupancyStatus", optional, tag = "9")]
     pub occupancy_status: Option<i32>,
+    // Field 10: occupancy_percentage (experimental)
+    #[prost(uint32, optional, tag = "10")]
+    pub occupancy_percentage: Option<u32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -118,8 +152,9 @@ pub struct Position {
     pub longitude: f32,
     #[prost(float, optional, tag = "3")]
     pub bearing: Option<f32>,
-    #[prost(float, optional, tag = "4")]
-    pub odometer: Option<f32>,
+    // Field 4: odometer is `double` in the spec, not `float`.
+    #[prost(double, optional, tag = "4")]
+    pub odometer: Option<f64>,
     #[prost(float, optional, tag = "5")]
     pub speed: Option<f32>,
 }
@@ -148,6 +183,9 @@ pub struct VehicleDescriptor {
     pub label: Option<String>,
     #[prost(string, optional, tag = "3")]
     pub license_plate: Option<String>,
+    // Field 4: wheelchair_accessible (experimental)
+    #[prost(enumeration = "WheelchairAccessible", optional, tag = "4")]
+    pub wheelchair_accessible: Option<i32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -164,7 +202,8 @@ pub struct EntitySelector {
     pub stop_id: Option<String>,
 }
 
-// Enumerations
+// MARK: - Enumerations
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
 #[repr(i32)]
 pub enum Incrementality {
@@ -172,13 +211,22 @@ pub enum Incrementality {
     Differential = 1,
 }
 
+/// Trip-level schedule relationship (TripDescriptor.schedule_relationship, field 4).
+/// Note: ADDED=1 is deprecated in the spec but still emitted by some feeds
+/// (e.g. Amtrak for charter/special trains). Treat it the same as SCHEDULED.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
 #[repr(i32)]
 pub enum ScheduleRelationship {
     Scheduled = 0,
+    /// Deprecated in spec; treat the same as Scheduled for filtering purposes.
     Added = 1,
     Unscheduled = 2,
     Canceled = 3,
+    // 4 is reserved in the spec
+    Replacement = 5,
+    Duplicated = 6,
+    Deleted = 7,
+    New = 8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
@@ -199,6 +247,9 @@ pub enum CongestionLevel {
     SevereCongestion = 4,
 }
 
+/// Occupancy status values — must match the spec exactly (values 0–8).
+/// Values 7 and 8 were previously missing, causing unexpected i32 values
+/// to reach Swift via the FFI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
 #[repr(i32)]
 pub enum OccupancyStatus {
@@ -209,9 +260,27 @@ pub enum OccupancyStatus {
     CrushedStandingRoomOnly = 4,
     Full = 5,
     NotAcceptingPassengers = 6,
+    /// No occupancy data available at this time.
+    NoDataAvailable = 7,
+    /// Vehicle is not boardable (engine, maintenance car, etc.).
+    NotBoardable = 8,
 }
 
-// MARK: - Simplified structs for FFI
+/// Wheelchair accessibility for VehicleDescriptor (field 4, experimental).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum WheelchairAccessible {
+    /// No value — does not override the static GTFS value.
+    NoValue = 0,
+    /// Overrides static GTFS: no information available.
+    Unknown = 1,
+    /// Overrides static GTFS: trip is wheelchair accessible.
+    WheelchairAccessible = 2,
+    /// Overrides static GTFS: trip is not wheelchair accessible.
+    WheelchairInaccessible = 3,
+}
+
+// MARK: - FFI Structs
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -223,7 +292,7 @@ pub struct FFIVehicle {
     pub speed: f32,
     pub route_id: *const c_char,
     pub trip_id: *const c_char,
-    pub label: *const c_char,   // VehicleDescriptor.label — human-readable name
+    pub label: *const c_char,   // VehicleDescriptor.label — human-readable train number/name
     pub timestamp: i64,
     pub has_bearing: bool,
     pub has_speed: bool,
@@ -274,23 +343,61 @@ impl GtfsRtManager {
         }
     }
 
-    /// Parse GTFS-RT protobuf data
+    /// Parse GTFS-RT protobuf data.
     pub fn parse_feed(&mut self, data: &[u8]) -> Result<(), String> {
         let feed = FeedMessage::decode(data)
             .map_err(|e| format!("Failed to decode protobuf: {}", e))?;
 
-        // Clear existing data
         self.vehicles.clear();
         self.trip_updates.clear();
         self.alerts.clear();
-
-        // Store feed timestamp
         self.last_update = feed.header.timestamp;
 
-        // Extract entities
+        // Deduplicate VehiclePosition by VehicleDescriptor.id only.
+        //
+        // Amtrak's feed can emit multiple entities for the same physical
+        // consist when a locomotive works a through-service connection
+        // (two trip_ids, one locomotive). When VehicleDescriptor.id is set
+        // it uniquely identifies the equipment; keep only the most recent
+        // timestamp for each id.
+        //
+        // IMPORTANT: do NOT fall back to VehicleDescriptor.label for dedup.
+        // label is the human-readable train number (e.g. "171"), and Amtrak
+        // can operate two genuine services with the same number on different
+        // branches (or when schedule changeovers overlap). Deduping by label
+        // would silently drop one of them. If id is absent, push unconditionally.
+        let mut seen_vehicle_ids: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
         for entity in feed.entity {
+            if entity.is_deleted.unwrap_or(false) {
+                continue;
+            }
             if let Some(vehicle) = entity.vehicle {
-                self.vehicles.push(vehicle);
+                // Only deduplicate when VehicleDescriptor.id is explicitly set.
+                let vid: Option<String> = vehicle
+                    .vehicle
+                    .as_ref()
+                    .and_then(|v| v.id.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                if let Some(vid) = vid {
+                    let new_ts = vehicle.timestamp.unwrap_or(0);
+                    if let Some(&existing_idx) = seen_vehicle_ids.get(&vid) {
+                        let existing_ts = self.vehicles[existing_idx].timestamp.unwrap_or(0);
+                        if new_ts > existing_ts {
+                            self.vehicles[existing_idx] = vehicle;
+                        }
+                    } else {
+                        let idx = self.vehicles.len();
+                        seen_vehicle_ids.insert(vid, idx);
+                        self.vehicles.push(vehicle);
+                    }
+                } else {
+                    // No id — push unconditionally; cannot safely dedup.
+                    self.vehicles.push(vehicle);
+                }
             }
             if let Some(trip_update) = entity.trip_update {
                 self.trip_updates.push(trip_update);
@@ -303,15 +410,16 @@ impl GtfsRtManager {
         Ok(())
     }
 
-    /// Get all vehicles as FFI-compatible structs
+    /// Get all vehicles as FFI-compatible structs.
     pub fn get_vehicles(&self) -> Vec<FFIVehicle> {
+        let header_ts = self.last_update.unwrap_or(0);
         self.vehicles
             .iter()
-            .filter_map(|v| self.vehicle_to_ffi(v))
+            .filter_map(|v| self.vehicle_to_ffi(v, header_ts))
             .collect()
     }
 
-    /// Get vehicles within a bounding box
+    /// Get vehicles within a bounding box.
     pub fn get_vehicles_in_region(
         &self,
         min_lat: f64,
@@ -319,15 +427,20 @@ impl GtfsRtManager {
         min_lon: f64,
         max_lon: f64,
     ) -> Vec<FFIVehicle> {
+        let header_ts = self.last_update.unwrap_or(0);
         self.vehicles
             .iter()
             .filter_map(|v| {
                 let pos = v.position.as_ref()?;
                 let lat = pos.latitude as f64;
                 let lon = pos.longitude as f64;
-
+                // Coordinate validity is enforced inside vehicle_to_ffi (check 0),
+                // but guard here too so the bounding-box test never runs on garbage values.
+                if !lat.is_finite() || !lon.is_finite() || (lat == 0.0 && lon == 0.0) {
+                    return None;
+                }
                 if lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon {
-                    self.vehicle_to_ffi(v)
+                    self.vehicle_to_ffi(v, header_ts)
                 } else {
                     None
                 }
@@ -335,12 +448,10 @@ impl GtfsRtManager {
             .collect()
     }
 
-    /// Get trip updates
     pub fn get_trip_updates(&self) -> &[TripUpdate] {
         &self.trip_updates
     }
 
-    /// Find trip update by trip ID
     pub fn find_trip_update(&self, trip_id: &str) -> Option<&TripUpdate> {
         self.trip_updates.iter().find(|tu| {
             tu.trip
@@ -351,19 +462,97 @@ impl GtfsRtManager {
         })
     }
 
-    /// Count vehicles
     pub fn vehicle_count(&self) -> usize {
         self.vehicles.len()
     }
 
-    /// Count trip updates
     pub fn trip_update_count(&self) -> usize {
         self.trip_updates.len()
     }
 
-    /// Convert VehiclePosition to FFI struct
-    fn vehicle_to_ffi(&self, vehicle: &VehiclePosition) -> Option<FFIVehicle> {
+    /// Convert VehiclePosition to FFI struct.
+    /// Filters out stale, canceled, and deleted vehicles before they reach Swift.
+    ///
+    /// `feed_header_ts` is the FeedHeader.timestamp from the last parsed feed.
+    /// It is used as a fallback when VehiclePosition.timestamp is absent — the
+    /// GTFS-RT spec says: "If this field is not present, use the timestamp from
+    /// the feed header." When we rely on the header timestamp we skip the
+    /// per-vehicle staleness check, since the header being recent tells us the
+    /// feed is fresh; we just don't know when this specific GPS fix was taken.
+    fn vehicle_to_ffi(&self, vehicle: &VehiclePosition, feed_header_ts: u64) -> Option<FFIVehicle> {
         let pos = vehicle.position.as_ref()?;
+
+        // 0. Reject invalid GPS coordinates before any other processing.
+        //
+        //    Feeds occasionally emit error-state positions of exactly (0.0, 0.0)
+        //    ("null island") when a GPS fix is unavailable, or values that are
+        //    out of the WGS-84 valid range. Both cause "jumping" train icons on
+        //    the map and must be filtered at the source.
+        //
+        //    Valid WGS-84: latitude ∈ [-90, 90], longitude ∈ [-180, 180].
+        //    We also reject NaN and ±Inf (IEEE 754 edge cases prost may produce
+        //    from malformed float wire values) and the exact (0.0, 0.0) pair
+        //    which is Amtrak's sentinel for "no GPS fix".
+        let lat = pos.latitude;
+        let lon = pos.longitude;
+        if !lat.is_finite()
+            || !lon.is_finite()
+            || lat < -90.0
+            || lat > 90.0
+            || lon < -180.0
+            || lon > 180.0
+            || (lat == 0.0 && lon == 0.0)
+        {
+            return None;
+        }
+
+        // 1. Staleness check.
+        //
+        //    VehiclePosition.timestamp is optional per the GTFS-RT spec. When
+        //    absent Amtrak's feed leaves the field unset (prost decodes this as
+        //    None). Applying unwrap_or(0) and then checking age > 0 would
+        //    silently drop every vehicle without a timestamp — the likely cause
+        //    of the 62 vs 109 train count discrepancy.
+        //
+        //    Spec guidance: "If not present, use the timestamp from the feed
+        //    header." We do exactly that, but we only apply the 4-hour staleness
+        //    guard when the timestamp is vehicle-specific. When we fall back to
+        //    the header timestamp we know the *feed* is fresh; we just can't say
+        //    how old this particular GPS fix is, so we let it through.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let (ts, apply_staleness_check) = match vehicle.timestamp {
+            Some(t) if t > 0 => (t, true),
+            _ => (feed_header_ts, false),
+        };
+
+        // If we have no timestamp at all (even the header is missing/zero),
+        // the position is unverifiable — drop it.
+        if ts == 0 {
+            return None;
+        }
+
+        if apply_staleness_check && now.saturating_sub(ts) > 4 * 60 * 60 {
+            return None;
+        }
+
+        // 2. Reject explicitly removed trips.
+        //    CANCELED=3, DELETED=7 per spec.
+        //    ADDED=1 (deprecated) is treated the same as SCHEDULED — do NOT filter it.
+        //    REPLACEMENT=5, DUPLICATED=6, NEW=8 are active trips — do NOT filter.
+        let schedule_rel = vehicle
+            .trip
+            .as_ref()
+            .and_then(|t| t.schedule_relationship)
+            .unwrap_or(0);
+        if schedule_rel == ScheduleRelationship::Canceled as i32
+            || schedule_rel == ScheduleRelationship::Deleted as i32
+        {
+            return None;
+        }
 
         // vehicle.vehicle.id is the machine ID; fall back to label if absent
         let id_str = vehicle
@@ -446,24 +635,25 @@ impl GtfsRtCore {
     }
 
     /// Look up trip update data for a specific trip_id.
-    /// Returns None if no matching TripUpdate exists.
+    ///
+    /// Delay extraction priority:
+    ///   1. TripUpdate.delay (field 5) — trip-level propagated delay. Highest
+    ///      authority but rarely populated by Amtrak.
+    ///   2. Last past StopTimeUpdate with an explicit delay value — reflects
+    ///      the train's current running delay based on stops already served.
+    ///      This is the primary source for Amtrak.
+    ///   3. First future StopTimeUpdate's delay — forward-looking estimate
+    ///      for trains not yet departed or when past stops lack delay data.
+    ///
+    /// The "next stop" finder skips SKIPPED stops (schedule_relationship = 1)
+    /// so passengers aren't directed to a stop the train won't serve.
     pub fn get_trip_update(&self, trip_id: &str) -> Result<Option<TripUpdateSummary>, String> {
         let mgr = self
             .manager
             .lock()
             .map_err(|_| "Failed to acquire lock".to_string())?;
 
-        // Normalise trip_id the same way gtfs_static does:
-        // "2026-02-27_AMTK_3" → try exact first, then last underscore token.
-        let tu = mgr.find_trip_update(trip_id).or_else(|| {
-            if trip_id.contains('_') {
-                trip_id.split('_').last().and_then(|t| mgr.find_trip_update(t))
-            } else {
-                None
-            }
-        });
-
-        let Some(tu) = tu else {
+        let Some(tu) = mgr.find_trip_update(trip_id) else {
             return Ok(None);
         };
 
@@ -472,33 +662,102 @@ impl GtfsRtCore {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // Next stop = first StopTimeUpdate with a future departure or arrival time.
+        // ── Step 1: Trip-level delay ────────────────────────────────────────
+        // Per spec: "Delay information in StopTimeUpdates take precedent of
+        // trip-level delay information." We still try this first because some
+        // feeds do populate it and it may be more current than stop-level data.
+        let mut delay_seconds: Option<i32> = tu.delay;
+
+        // ── Step 2: Last past StopTimeUpdate with an explicit delay ─────────
+        // "Past" means the predicted departure (or arrival) time is <= now.
+        // We want the *last* such stop because it's the most recently observed
+        // delay measurement — i.e., what the train is doing right now.
+        if delay_seconds.is_none() {
+            delay_seconds = tu
+                .stop_time_update
+                .iter()
+                .filter(|stu| {
+                    // Not a skipped or no-data stop
+                    let rel = stu.schedule_relationship.unwrap_or(
+                        stop_time_schedule_relationship::SCHEDULED,
+                    );
+                    if rel == stop_time_schedule_relationship::SKIPPED
+                        || rel == stop_time_schedule_relationship::NO_DATA
+                    {
+                        return false;
+                    }
+                    // The stop's predicted time must be in the past
+                    let t = stu
+                        .departure
+                        .as_ref()
+                        .and_then(|e| e.time)
+                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.time))
+                        .unwrap_or(i64::MAX);
+                    t <= now
+                })
+                .filter_map(|stu| {
+                    // Prefer departure delay; fall back to arrival delay
+                    stu.departure
+                        .as_ref()
+                        .and_then(|e| e.delay)
+                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.delay))
+                })
+                .last();
+        }
+
+        // ── Step 3: First future StopTimeUpdate's delay ─────────────────────
+        // Covers trains not yet departed or when past stops lack delay values.
+        if delay_seconds.is_none() {
+            delay_seconds = tu
+                .stop_time_update
+                .iter()
+                .filter(|stu| {
+                    let rel = stu.schedule_relationship.unwrap_or(
+                        stop_time_schedule_relationship::SCHEDULED,
+                    );
+                    if rel == stop_time_schedule_relationship::SKIPPED
+                        || rel == stop_time_schedule_relationship::NO_DATA
+                    {
+                        return false;
+                    }
+                    let t = stu
+                        .arrival
+                        .as_ref()
+                        .and_then(|e| e.time)
+                        .or_else(|| stu.departure.as_ref().and_then(|e| e.time))
+                        .unwrap_or(0);
+                    t > now
+                })
+                .find_map(|stu| {
+                    stu.arrival
+                        .as_ref()
+                        .and_then(|e| e.delay)
+                        .or_else(|| stu.departure.as_ref().and_then(|e| e.delay))
+                });
+        }
+
+        let has_delay = delay_seconds.is_some();
+
+        // ── Next stop ───────────────────────────────────────────────────────
+        // First future stop, excluding SKIPPED and NO_DATA entries so we
+        // never direct a passenger to a stop the train won't serve.
         let next = tu.stop_time_update.iter().find(|stu| {
+            let rel = stu
+                .schedule_relationship
+                .unwrap_or(stop_time_schedule_relationship::SCHEDULED);
+            if rel == stop_time_schedule_relationship::SKIPPED
+                || rel == stop_time_schedule_relationship::NO_DATA
+            {
+                return false;
+            }
+            // A stop is "upcoming" if its departure or arrival time is in the future.
             let t = stu
-                .departure.as_ref().and_then(|e| e.time)
+                .departure
+                .as_ref()
+                .and_then(|e| e.time)
                 .or_else(|| stu.arrival.as_ref().and_then(|e| e.time));
             t.map(|ts| ts > now).unwrap_or(false)
         });
-
-        // Amtrak does not populate TripUpdate.delay — derive it from stop-level events.
-        // Priority: (1) top-level trip delay, (2) next stop's delay,
-        // (3) most recent past stop's delay.
-        let stu_delay = |stu: &StopTimeUpdate| -> Option<i32> {
-            stu.arrival.as_ref().and_then(|e| e.delay)
-                .or_else(|| stu.departure.as_ref().and_then(|e| e.delay))
-        };
-        let delay_seconds: Option<i32> = tu.delay
-            .or_else(|| next.and_then(stu_delay))
-            .or_else(|| {
-                // Fall back to most recent past stop (last one before now)
-                tu.stop_time_update.iter().rev().find(|stu| {
-                    let t = stu.departure.as_ref().and_then(|e| e.time)
-                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.time));
-                    t.map(|ts| ts <= now).unwrap_or(false)
-                })
-                    .and_then(stu_delay)
-            });
-        let has_delay = delay_seconds.is_some();
 
         let next_stop_id = next
             .and_then(|s| s.stop_id.as_ref())
@@ -524,7 +783,7 @@ impl GtfsRtCore {
 pub struct TripUpdateSummary {
     /// Overall trip delay in seconds (positive = late, negative = early).
     pub delay_seconds: i32,
-    /// True if `delay_seconds` is meaningful.
+    /// True if `delay_seconds` is meaningful (i.e., the feed provided delay data).
     pub has_delay: bool,
     /// C string of the next upcoming stop_id, or null.
     pub next_stop_id: *const c_char,

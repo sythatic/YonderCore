@@ -21,10 +21,13 @@ typedef struct {
 	float speed;
 	const char* route_id;
 	const char* trip_id;
-	const char* label;      // ← this line
+	const char* label;      // VehicleDescriptor.label — human-readable train name/number
 	int64_t timestamp;
 	bool has_bearing;
 	bool has_speed;
+	/// OccupancyStatus per GTFS-RT spec. Valid range: 0–8.
+	/// 0=EMPTY  1=MANY_SEATS  2=FEW_SEATS  3=STANDING_ROOM  4=CRUSHED_STANDING
+	/// 5=FULL   6=NOT_ACCEPTING  7=NO_DATA_AVAILABLE  8=NOT_BOARDABLE
 	int32_t occupancy_status;
 } FFIVehicle;
 
@@ -91,6 +94,13 @@ void gtfs_rt_free(GtfsRtCore* core);
 
 /// Flat summary of a TripUpdate for a single trip.
 /// Returned by gtfs_rt_get_trip_update(); free with gtfs_rt_free_trip_update().
+///
+/// delay_seconds is populated via a three-step fallback:
+///   1. TripUpdate.delay (trip-level; rarely set by Amtrak)
+///   2. Last past StopTimeUpdate.{departure,arrival}.delay (primary Amtrak source)
+///   3. First future StopTimeUpdate delay (pre-departure estimate)
+/// has_delay is false when none of the three sources provided delay data,
+/// meaning the train's status is genuinely unknown (not necessarily on time).
 typedef struct {
     int32_t  delay_seconds;      // overall trip delay (positive = late, negative = early)
     bool     has_delay;          // true if delay_seconds is meaningful
@@ -141,8 +151,14 @@ void gtfs_static_free_result(GTFSStaticResult* result);
 /// Free range array from gtfs_static_feed_eocd.
 void gtfs_static_free_ranges(GTFSZipRange* ranges, size_t count);
 
-/// Returns 1 if static data is fully loaded.
+/// Returns 1 if static data is fully loaded (routes + trips + stop_times).
 int32_t gtfs_static_is_loaded(void);
+
+/// Returns 1 if `trip_id` is scheduled to be active at `now_unix` (Unix timestamp).
+/// Returns 0 if pre-departure, completed, or not found in static data.
+/// Returns 1 (pass-through) if stop_times haven't loaded yet, so no vehicles
+/// are incorrectly hidden during the initial load.
+int32_t gtfs_static_is_trip_active(const char* trip_id, int64_t now_unix);
 
 /// Clear all loaded static data.
 void gtfs_static_reset(void);

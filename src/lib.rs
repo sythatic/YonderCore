@@ -1010,7 +1010,9 @@ pub extern "C" fn gtfs_rt_free_vehicles(vehicles: *mut FFIVehicle, count: usize)
         // Create slice to iterate over
         let vehicles_slice = std::slice::from_raw_parts_mut(vehicles, count);
 
-        // Free each string field
+        // Free each string field.
+        // NOTE: label is allocated via CString::into_raw() in vehicle_to_ffi()
+        // and must be freed here alongside id, route_id, and trip_id.
         for vehicle in vehicles_slice.iter() {
             if !vehicle.id.is_null() {
                 let _ = CString::from_raw(vehicle.id as *mut c_char);
@@ -1020,6 +1022,9 @@ pub extern "C" fn gtfs_rt_free_vehicles(vehicles: *mut FFIVehicle, count: usize)
             }
             if !vehicle.trip_id.is_null() {
                 let _ = CString::from_raw(vehicle.trip_id as *mut c_char);
+            }
+            if !vehicle.label.is_null() {
+                let _ = CString::from_raw(vehicle.label as *mut c_char);
             }
         }
 
@@ -1067,6 +1072,8 @@ pub extern "C" fn gtfs_rt_get_trip_update(
 }
 
 /// Free a TripUpdateSummary returned by gtfs_rt_get_trip_update.
+/// next_stop_id is a CString allocated by Rust via into_raw() and is
+/// explicitly freed here before dropping the struct — no leak occurs.
 #[no_mangle]
 pub extern "C" fn gtfs_rt_free_trip_update(summary: *mut TripUpdateSummary) {
     if summary.is_null() {

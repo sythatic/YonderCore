@@ -1,22 +1,28 @@
 /// GTFS Static Lookup — parses Amtrak's GTFS.zip via HTTP range requests.
 ///
 /// The ZIP format stores its Central Directory at the end of the file, so we
-/// can read just `trips.txt` and `routes.txt` without downloading the whole
-/// archive:
+/// can read just `trips.txt`, `routes.txt`, and `stop_times.txt` without
+/// downloading the whole archive:
 ///
-///   1. Swift fetches the last 65 KB  →  `gtfs_static_feed_eocd()`
+///   1. Swift fetches the last 256 KB  →  `gtfs_static_feed_eocd()`
 ///      Rust finds the Central Directory, returns the byte ranges needed for
-///      `trips.txt` and `routes.txt` back to Swift.
+///      `trips.txt`, `routes.txt`, and `stop_times.txt` back to Swift.
 ///
-///   2. Swift issues two HTTP Range requests for those byte ranges
+///   2. Swift issues three HTTP Range requests for those byte ranges
 ///      →  `gtfs_static_feed_file("trips", data, len)`
 ///         `gtfs_static_feed_file("routes", data, len)`
+///         `gtfs_static_feed_file("stop_times", data, len)`
 ///      Rust inflates and parses each file.
 ///
 ///   3. Swift calls `gtfs_static_lookup(trip_id)` at display time.
 ///      Rust returns a `GTFSStaticResult { train_number, route_name }`.
 ///
-/// Thread safety: all state lives behind a `RwLock`; parsing is write-locked,
+///   4. Swift calls `gtfs_static_is_trip_active(trip_id, now_eastern)` to check
+///      whether a trip is between its first departure and last arrival.
+///      `now_eastern` is `now_unix + Eastern UTC offset` (DST-aware, from Swift).
+///      This is the primary filter for non-revenue vehicles.
+///
+/// Thread safety: all state lives behind a `Mutex`; parsing is write-locked,
 /// lookups are read-locked.
 
 use std::collections::HashMap;
@@ -42,6 +48,10 @@ struct GtfsStaticStore {
     route_names: HashMap<String, String>,
     /// trip_id → (train_number, route_id)  e.g. "168-amtrak_…" → ("168", "NEC")
     trips: HashMap<String, (String, String)>,
+    /// trip_id → (first_departure_secs, last_arrival_secs) from midnight of
+    /// the service day. Values can exceed 86400 for overnight/multi-day trips.
+    /// Used by `is_trip_active` to reject yard/deadhead/pre-departure vehicles.
+    trip_windows: HashMap<String, (u32, u32)>,
     /// Pending central-directory entries indexed by filename
     cd_entries: HashMap<String, CdEntry>,
 }
@@ -63,6 +73,7 @@ impl GtfsStaticStore {
         Self {
             route_names: HashMap::new(),
             trips: HashMap::new(),
+            trip_windows: HashMap::new(),
             cd_entries: HashMap::new(),
         }
     }
@@ -106,6 +117,64 @@ impl GtfsStaticStore {
         }
 
         None
+    }
+
+    /// Returns true if `now_eastern` (Unix timestamp already adjusted to Eastern
+    /// Time by the caller) falls within the active window of the trip.
+    ///
+    /// **Caller contract**: `now_eastern` must be `now_unix + eastern_utc_offset_secs`
+    /// so that integer division by 86 400 yields the correct Eastern-calendar
+    /// midnight. Swift satisfies this with Foundation's DST-aware:
+    ///   `Int64(now.timeIntervalSince1970) +
+    ///    Int64(TimeZone(identifier: "America/New_York")!.secondsFromGMT(for: now))`
+    ///
+    /// Strategy:
+    /// - Look up the trip's (first_dep, last_arr) in seconds-from-Eastern-midnight.
+    /// - For each of the last 4 Eastern midnights, compute absolute [start, end]
+    ///   and check whether now_eastern falls within the window (+ 2 h delay buffer).
+    ///   This covers same-day trips AND long-distance trains that departed on a
+    ///   prior calendar day (California Zephyr ~65 h, Auto Train ~18 h, etc.).
+    /// - If the trip has no window data (stop_times not loaded yet), return
+    ///   true so vehicles aren't incorrectly hidden before the file loads.
+    fn is_trip_active(&self, trip_id: &str, now_eastern: i64) -> bool {
+        // Resolve the canonical trip_id (handles prefixed RT formats)
+        let canonical = if self.trip_windows.contains_key(trip_id) {
+            trip_id.to_string()
+        } else if trip_id.contains('_') {
+            trip_id
+                .split('_')
+                .last()
+                .unwrap_or(trip_id)
+                .to_string()
+        } else {
+            trip_id.to_string()
+        };
+
+        let Some(&(first_dep, last_arr)) = self.trip_windows.get(canonical.as_str()) else {
+            // No window data — degrade gracefully (don't hide the vehicle)
+            return true;
+        };
+
+        const DELAY_BUFFER_SECS: u32 = 2 * 60 * 60; // 2 h buffer for late trains
+        const SECS_PER_DAY: i64 = 86_400;
+
+        let window_end = last_arr.saturating_add(DELAY_BUFFER_SECS);
+
+        // Check today's Eastern midnight and up to 3 prior midnights.
+        // Using now_eastern means integer division gives the Eastern calendar day,
+        // so abs_start/abs_end are correctly anchored against GTFS service-day times.
+        // Absolute comparison handles both same-day and multi-day trips uniformly —
+        // no special-casing needed for last_arr > 86400.
+        for days_ago in 0i64..=3 {
+            let midnight   = (now_eastern / SECS_PER_DAY - days_ago) * SECS_PER_DAY;
+            let abs_start  = midnight + first_dep as i64;
+            let abs_end    = midnight + window_end as i64;
+            if now_eastern >= abs_start && now_eastern <= abs_end {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -191,7 +260,7 @@ fn parse_eocd(data: &[u8]) -> Result<Vec<(String, u64, u64)>, String> {
 
     // Filter to files we need; compute byte range = local header + 30 + fname + extra + data
     // We'll ask Swift for a conservative range: local_header_offset + 30 + fname_max + compressed_size
-    let targets = ["trips.txt", "routes.txt"];
+    let targets = ["trips.txt", "routes.txt", "stop_times.txt"];
     let mut ranges = Vec::new();
 
     for target in &targets {
@@ -260,6 +329,63 @@ fn decompress_local_entry(data: &[u8], entry: &CdEntry) -> Result<Vec<u8>, Strin
 }
 
 // ── CSV parsing ──────────────────────────────────────────────────────────────
+
+/// Parse a GTFS time string like "08:30:00" or "25:10:00" (overnight) into
+/// total seconds from midnight. Values > 86400 are valid for multi-day trips.
+fn parse_gtfs_time(s: &str) -> Option<u32> {
+    let mut parts = s.trim().splitn(3, ':');
+    let h: u32 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let sec: u32 = parts.next()?.parse().ok()?;
+    Some(h * 3600 + m * 60 + sec)
+}
+
+/// Build trip_id → (first_departure_secs, last_arrival_secs) from stop_times.txt.
+/// These values are seconds-from-midnight on the service day and can exceed
+/// 86400 for overnight/multi-day trains (GTFS spec allows e.g. "25:10:00").
+fn parse_stop_times(data: &[u8]) -> Result<HashMap<String, (u32, u32)>, String> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .flexible(true)
+        .from_reader(data);
+
+    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
+
+    let trip_id_idx = headers.iter().position(|h| h == "trip_id")
+        .ok_or("stop_times.txt: missing trip_id column")?;
+    let arr_idx = headers.iter().position(|h| h == "arrival_time");
+    let dep_idx = headers.iter().position(|h| h == "departure_time");
+
+    if arr_idx.is_none() && dep_idx.is_none() {
+        return Err("stop_times.txt: missing both arrival_time and departure_time".into());
+    }
+
+    let mut map: HashMap<String, (u32, u32)> = HashMap::new();
+
+    for result in rdr.records() {
+        let record = result.map_err(|e| e.to_string())?;
+        let trip_id = match record.get(trip_id_idx) {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => continue,
+        };
+
+        // Prefer departure; fall back to arrival
+        let t = dep_idx
+            .and_then(|i| record.get(i))
+            .and_then(|s| parse_gtfs_time(s))
+            .or_else(|| arr_idx.and_then(|i| record.get(i)).and_then(|s| parse_gtfs_time(s)));
+
+        let Some(t) = t else { continue };
+
+        map.entry(trip_id)
+            .and_modify(|(first, last)| {
+                if t < *first { *first = t; }
+                if t > *last  { *last  = t; }
+            })
+            .or_insert((t, t));
+    }
+
+    Ok(map)
+}
 
 fn parse_routes(data: &[u8]) -> Result<HashMap<String, String>, String> {
     let mut rdr = csv::ReaderBuilder::new()
@@ -459,7 +585,13 @@ pub extern "C" fn gtfs_static_feed_file(
     match fname.as_str() {
         "routes.txt" => match parse_routes(&decompressed) {
             Ok(map) => {
-                s.route_names.extend(map);
+                // Use or_insert so the first feed loaded wins on route_id collisions.
+                // GR route_ids (small integers: 1, 3, 6 …) share the same namespace
+                // as Amtrak route_ids in this table. Amtrak is authoritative for its
+                // own routes; GR routes not already in the table are inserted normally.
+                for (k, v) in map {
+                    s.route_names.entry(k).or_insert(v);
+                }
                 0
             }
             Err(e) => {
@@ -469,11 +601,42 @@ pub extern "C" fn gtfs_static_feed_file(
         },
         "trips.txt" => match parse_trips(&decompressed) {
             Ok(map) => {
-                s.trips.extend(map);
+                // Use or_insert so the first feed loaded (Amtrak) always wins when
+                // the same key appears in a later feed (Gold Runner).
+                //
+                // parse_trips inserts TWO keys per trip:
+                //   • trip_id          (primary, globally unique)
+                //   • trip_short_name  (secondary, shared across service days)
+                //
+                // The secondary "train number" key is where collisions occur: GR's
+                // trip_id space (701–6619) overlaps with Amtrak Thruway Connecting
+                // Service train numbers (3602–6619). Without this guard, loading GR
+                // second silently reassigns those 78 train-number keys to Gold Runner
+                // routes, so every Amtrak Thruway vehicle in that range would display
+                // the wrong route name ("GR Route 1" instead of "Amtrak Thruway…").
+                //
+                // GR keys not already in the table (e.g. GR-only trains 701–3601)
+                // are still inserted correctly; only Amtrak-claimed keys are protected.
+                for (k, v) in map {
+                    s.trips.entry(k).or_insert(v);
+                }
                 0
             }
             Err(e) => {
                 eprintln!("parse_trips: {}", e);
+                -1
+            }
+        },
+        "stop_times.txt" => match parse_stop_times(&decompressed) {
+            Ok(map) => {
+                // stop_times are keyed by the static trip_id, which is unique across
+                // both feeds (Amtrak uses large integers ~230000+; GR uses small
+                // integers matching their trip_id). No collision risk; extend is safe.
+                s.trip_windows.extend(map);
+                0
+            }
+            Err(e) => {
+                eprintln!("parse_stop_times: {}", e);
                 -1
             }
         },
@@ -559,11 +722,38 @@ pub extern "C" fn gtfs_static_free_ranges(ranges: *mut GTFSZipRange, count: usiz
     }
 }
 
-/// Returns 1 if both routes and trips tables are loaded, 0 otherwise.
+/// Returns 1 if routes, trips, and stop_times tables are all loaded, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn gtfs_static_is_loaded() -> i32 {
     let s = store().lock().unwrap();
-    if !s.route_names.is_empty() && !s.trips.is_empty() { 1 } else { 0 }
+    if !s.route_names.is_empty() && !s.trips.is_empty() && !s.trip_windows.is_empty() { 1 } else { 0 }
+}
+
+/// Returns 1 if `trip_id` is scheduled to be active at `now_eastern`.
+/// Returns 0 if pre-departure, completed, or not found in static data.
+/// Returns 1 (pass-through) if stop_times haven't loaded yet.
+///
+/// `now_eastern` must be a Unix timestamp already adjusted to Eastern Time:
+///   now_eastern = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
+/// Swift is responsible for the DST-aware offset; the C signature is unchanged.
+#[no_mangle]
+pub extern "C" fn gtfs_static_is_trip_active(
+    trip_id: *const c_char,
+    now_eastern: i64,
+) -> i32 {
+    if trip_id.is_null() {
+        return 0;
+    }
+    let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let s = store().lock().unwrap();
+    // If stop_times haven't loaded yet, don't hide any vehicles
+    if s.trip_windows.is_empty() {
+        return 1;
+    }
+    if s.is_trip_active(tid, now_eastern) { 1 } else { 0 }
 }
 
 /// Evict all loaded data (e.g. before a refresh).
@@ -572,5 +762,6 @@ pub extern "C" fn gtfs_static_reset() {
     let mut s = store().lock().unwrap();
     s.route_names.clear();
     s.trips.clear();
+    s.trip_windows.clear();
     s.cd_entries.clear();
 }

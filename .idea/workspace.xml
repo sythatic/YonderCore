@@ -15,6 +15,7 @@
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/YonderCore.h" beforeDir="false" afterPath="$PROJECT_DIR$/YonderCore.h" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/gtfs_rt.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/gtfs_rt.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/gtfs_static.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/gtfs_static.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/lib.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/lib.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -114,7 +115,7 @@
       <workItem from="1762267568659" duration="14998000" />
       <workItem from="1771914646131" duration="139000" />
       <workItem from="1772249838201" duration="1294000" />
-      <workItem from="1772251280776" duration="5284000" />
+      <workItem from="1772251280776" duration="12535000" />
     </task>
     <servers />
   </component>
