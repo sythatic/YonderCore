@@ -544,6 +544,81 @@ pub extern "C" fn stops_db_count(db: *const StopsDatabase) -> usize {
     }
 }
 
+/// Find a single stop by its stop_id. Uses the O(1) HashMap index.
+/// Returns a single-element `char**` array (same format as `stops_db_find_near`)
+/// with `*out_count` set to 1, or NULL with `*out_count` = 0 if not found.
+/// Free with `stops_db_free_results`.
+#[no_mangle]
+pub extern "C" fn stops_db_find_by_id(
+    db: *const StopsDatabase,
+    stop_id: *const c_char,
+    out_count: *mut usize,
+) -> *mut *mut c_char {
+    if db.is_null() || stop_id.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        let db = &*db;
+
+        let id_str = match CStr::from_ptr(stop_id).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                *out_count = 0;
+                return std::ptr::null_mut();
+            }
+        };
+
+        match db.find_by_id(id_str) {
+            Ok(Some(stop)) => stops_to_c_string_array(std::slice::from_ref(&stop), out_count),
+            _ => {
+                *out_count = 0;
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
+/// Find all stops whose providers list contains the given provider string.
+/// Returns a `char**` array in the same format as `stops_db_find_near`.
+/// Free with `stops_db_free_results`.
+#[no_mangle]
+pub extern "C" fn stops_db_find_by_provider(
+    db: *const StopsDatabase,
+    provider: *const c_char,
+    out_count: *mut usize,
+) -> *mut *mut c_char {
+    if db.is_null() || provider.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        let db = &*db;
+
+        let provider_str = match CStr::from_ptr(provider).to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                *out_count = 0;
+                return std::ptr::null_mut();
+            }
+        };
+
+        match db.get_all() {
+            Ok(stops) => {
+                let matching: Vec<GTFSStop> = stops
+                    .into_iter()
+                    .filter(|s| s.providers.iter().any(|p| p.as_ref() == provider_str))
+                    .collect();
+                stops_to_c_string_array(&matching, out_count)
+            }
+            Err(_) => {
+                *out_count = 0;
+                std::ptr::null_mut()
+            }
+        }
+    }
+}
+
 /// Free the stops database
 #[no_mangle]
 pub extern "C" fn stops_db_free(db: *mut StopsDatabase) {
@@ -922,6 +997,85 @@ pub extern "C" fn tile_cache_is_negative(
     }
 }
 // MARK: - GTFS-RT FFI Functions
+
+/// Get active vehicles, pre-filtered by schedule window and pre-enriched with
+/// TripUpdate data (delay + next stop).
+///
+/// `now_eastern` must be the current Unix timestamp shifted by the Eastern Time
+/// UTC offset (DST-aware):
+///   `now_unix + TimeZone("America/New_York").secondsFromGMT(now)`
+///
+/// This replaces the previous Swift loop that called `gtfs_static_is_trip_active`
+/// and `gtfs_rt_get_trip_update` individually for each vehicle — reducing N×2
+/// FFI crossings per update cycle to a single call.
+///
+/// Returns a pointer to a heap-allocated array of `FFIEnrichedVehicle`.
+/// Sets `*out_count` to the number of vehicles.
+/// Returns NULL when there are no active vehicles.
+/// Free with `gtfs_rt_free_enriched_vehicles`.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_get_active_enriched_vehicles(
+    core: *const GtfsRtCore,
+    now_eastern: i64,
+    out_count: *mut usize,
+) -> *mut FFIEnrichedVehicle {
+    if core.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        let core = &*core;
+
+        let vehicles = match core.get_active_enriched_vehicles(now_eastern) {
+            Ok(v) => v,
+            Err(_) => {
+                *out_count = 0;
+                return std::ptr::null_mut();
+            }
+        };
+
+        *out_count = vehicles.len();
+
+        if vehicles.is_empty() {
+            return std::ptr::null_mut();
+        }
+
+        let boxed = vehicles.into_boxed_slice();
+        Box::into_raw(boxed) as *mut FFIEnrichedVehicle
+    }
+}
+
+/// Free the array returned by `gtfs_rt_get_active_enriched_vehicles`.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_free_enriched_vehicles(vehicles: *mut FFIEnrichedVehicle, count: usize) {
+    if vehicles.is_null() || count == 0 {
+        return;
+    }
+
+    unsafe {
+        let vehicles_slice = std::slice::from_raw_parts(vehicles, count);
+
+        for vehicle in vehicles_slice.iter() {
+            if !vehicle.id.is_null() {
+                let _ = CString::from_raw(vehicle.id as *mut c_char);
+            }
+            if !vehicle.route_id.is_null() {
+                let _ = CString::from_raw(vehicle.route_id as *mut c_char);
+            }
+            if !vehicle.trip_id.is_null() {
+                let _ = CString::from_raw(vehicle.trip_id as *mut c_char);
+            }
+            if !vehicle.label.is_null() {
+                let _ = CString::from_raw(vehicle.label as *mut c_char);
+            }
+            if !vehicle.next_stop_id.is_null() {
+                let _ = CString::from_raw(vehicle.next_stop_id as *mut c_char);
+            }
+        }
+
+        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(vehicles, count));
+    }
+}
 
 /// Create a new GTFS-RT manager
 #[no_mangle]

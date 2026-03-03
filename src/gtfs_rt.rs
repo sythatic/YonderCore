@@ -462,6 +462,133 @@ impl GtfsRtManager {
         })
     }
 
+    /// Internal trip-update extraction used by `GtfsRtCore::get_active_enriched_vehicles`.
+    /// Does not acquire any lock (caller already holds the manager lock).
+    /// Returns `(delay_seconds, has_delay, next_stop_id_ptr, next_arrival_time, has_next_stop)`.
+    /// The returned `next_stop_id` pointer is a CString allocated via `into_raw()`; the
+    /// caller must free it with `CString::from_raw` when it is no longer needed.
+    pub(crate) fn get_trip_update_inner(
+        &self,
+        trip_id: &str,
+    ) -> Option<(i32, bool, *const c_char, i64, bool)> {
+        let tu = self.find_trip_update(trip_id)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let mut delay_seconds: Option<i32> = tu.delay;
+
+        if delay_seconds.is_none() {
+            delay_seconds = tu
+                .stop_time_update
+                .iter()
+                .filter(|stu| {
+                    let rel = stu.schedule_relationship.unwrap_or(
+                        stop_time_schedule_relationship::SCHEDULED,
+                    );
+                    if rel == stop_time_schedule_relationship::SKIPPED
+                        || rel == stop_time_schedule_relationship::NO_DATA
+                    {
+                        return false;
+                    }
+                    let t = stu
+                        .departure
+                        .as_ref()
+                        .and_then(|e| e.time)
+                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.time))
+                        .unwrap_or(i64::MAX);
+                    t <= now
+                })
+                .filter_map(|stu| {
+                    stu.departure
+                        .as_ref()
+                        .and_then(|e| e.delay)
+                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.delay))
+                })
+                .last();
+        }
+
+        if delay_seconds.is_none() {
+            delay_seconds = tu
+                .stop_time_update
+                .iter()
+                .filter(|stu| {
+                    let rel = stu.schedule_relationship.unwrap_or(
+                        stop_time_schedule_relationship::SCHEDULED,
+                    );
+                    if rel == stop_time_schedule_relationship::SKIPPED
+                        || rel == stop_time_schedule_relationship::NO_DATA
+                    {
+                        return false;
+                    }
+                    let t = stu
+                        .arrival
+                        .as_ref()
+                        .and_then(|e| e.time)
+                        .or_else(|| stu.departure.as_ref().and_then(|e| e.time))
+                        .unwrap_or(0);
+                    t > now
+                })
+                .find_map(|stu| {
+                    stu.arrival
+                        .as_ref()
+                        .and_then(|e| e.delay)
+                        .or_else(|| stu.departure.as_ref().and_then(|e| e.delay))
+                });
+        }
+
+        const MAX_PLAUSIBLE_DELAY_SECS: i32 = 6 * 3600;
+        if let Some(d) = delay_seconds {
+            if d.abs() > MAX_PLAUSIBLE_DELAY_SECS {
+                delay_seconds = None;
+            }
+        }
+
+        if let Some(trip_delay) = tu.delay {
+            match delay_seconds {
+                Some(stop_delay) if (stop_delay - trip_delay).abs() > 3600 => {
+                    delay_seconds = Some(trip_delay);
+                }
+                None => {
+                    delay_seconds = Some(trip_delay);
+                }
+                _ => {}
+            }
+        }
+
+        let has_delay = delay_seconds.is_some();
+
+        let next = tu.stop_time_update.iter().find(|stu| {
+            let rel = stu
+                .schedule_relationship
+                .unwrap_or(stop_time_schedule_relationship::SCHEDULED);
+            if rel == stop_time_schedule_relationship::SKIPPED
+                || rel == stop_time_schedule_relationship::NO_DATA
+            {
+                return false;
+            }
+            let t = stu
+                .departure
+                .as_ref()
+                .and_then(|e| e.time)
+                .or_else(|| stu.arrival.as_ref().and_then(|e| e.time));
+            t.map(|ts| ts > now).unwrap_or(false)
+        });
+
+        let next_stop_id: *const c_char = next
+            .and_then(|s| s.stop_id.as_ref())
+            .and_then(|s| CString::new(s.as_str()).ok())
+            .map_or(std::ptr::null(), |s| s.into_raw());
+
+        let next_arrival_time = next
+            .and_then(|s| s.arrival.as_ref().and_then(|e| e.time))
+            .unwrap_or(0);
+
+        Some((delay_seconds.unwrap_or(0), has_delay, next_stop_id, next_arrival_time, next.is_some()))
+    }
+
     pub fn vehicle_count(&self) -> usize {
         self.vehicles.len()
     }
@@ -632,6 +759,103 @@ impl GtfsRtCore {
             .lock()
             .map_err(|_| "Failed to acquire lock".to_string())?
             .vehicle_count())
+    }
+
+    /// Return active vehicles, already enriched with TripUpdate data.
+    ///
+    /// `now_eastern` is the current Unix timestamp shifted by the Eastern Time
+    /// UTC offset (DST-aware): `now_unix + TimeZone("America/New_York").secondsFromGMT(now)`.
+    /// This value is forwarded to `gtfs_static_is_trip_active` which works in
+    /// Eastern "seconds from midnight".
+    ///
+    /// Only vehicles whose trip passes the schedule-window gate are included.
+    /// The gate returns 1 (pass) while stop_times are still loading, so no
+    /// vehicles are incorrectly hidden during startup.
+    ///
+    /// The result is a single lock acquisition + a single heap allocation,
+    /// replacing the previous Swift pattern of N×`gtfs_static_is_trip_active`
+    /// calls followed by N×`gtfs_rt_get_trip_update` calls.
+    pub fn get_active_enriched_vehicles(&self, now_eastern: i64) -> Result<Vec<FFIEnrichedVehicle>, String> {
+        use crate::gtfs_static_is_trip_active;
+
+        let mgr = self
+            .manager
+            .lock()
+            .map_err(|_| "Failed to acquire lock".to_string())?;
+
+        let header_ts = mgr.last_update.unwrap_or(0);
+
+        let mut result = Vec::with_capacity(mgr.vehicles.len());
+
+        for vehicle in &mgr.vehicles {
+            // Step 1 — convert to FFI struct (staleness / coordinate / schedule filters)
+            let ffi = match mgr.vehicle_to_ffi(vehicle, header_ts) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Step 2 — schedule-window filter via existing Rust function.
+            // Safety: ffi.trip_id is either null or a valid CString we just
+            // created inside vehicle_to_ffi; we consume it below regardless.
+            let trip_id_cstr: Option<&std::ffi::CStr> = if ffi.trip_id.is_null() {
+                None
+            } else {
+                // SAFETY: pointer was just produced by CString::into_raw() in vehicle_to_ffi.
+                Some(unsafe { std::ffi::CStr::from_ptr(ffi.trip_id) })
+            };
+
+            let is_active = if let Some(tid) = trip_id_cstr {
+                // SAFETY: gtfs_static_is_trip_active expects a valid C string pointer.
+                unsafe { gtfs_static_is_trip_active(ffi.trip_id, now_eastern) == 1 }
+            } else {
+                true // No trip_id → cannot filter; let it through
+            };
+
+            if !is_active {
+                // Free strings allocated by vehicle_to_ffi before skipping.
+                unsafe {
+                    if !ffi.id.is_null() { let _ = std::ffi::CString::from_raw(ffi.id as *mut _); }
+                    if !ffi.route_id.is_null() { let _ = std::ffi::CString::from_raw(ffi.route_id as *mut _); }
+                    if !ffi.trip_id.is_null() { let _ = std::ffi::CString::from_raw(ffi.trip_id as *mut _); }
+                    if !ffi.label.is_null() { let _ = std::ffi::CString::from_raw(ffi.label as *mut _); }
+                }
+                continue;
+            }
+
+            // Step 3 — enrich with TripUpdate data (reuse the existing logic).
+            let (delay_seconds, has_delay, next_stop_id, next_arrival_time, has_next_stop) =
+                if let Some(tid) = trip_id_cstr {
+                    let tid_str = tid.to_str().unwrap_or("");
+                    match mgr.get_trip_update_inner(tid_str) {
+                        Some(tu) => tu,
+                        None => (0, false, std::ptr::null(), 0, false),
+                    }
+                } else {
+                    (0, false, std::ptr::null(), 0, false)
+                };
+
+            result.push(FFIEnrichedVehicle {
+                id: ffi.id,
+                latitude: ffi.latitude,
+                longitude: ffi.longitude,
+                bearing: ffi.bearing,
+                speed: ffi.speed,
+                route_id: ffi.route_id,
+                trip_id: ffi.trip_id,
+                label: ffi.label,
+                timestamp: ffi.timestamp,
+                has_bearing: ffi.has_bearing,
+                has_speed: ffi.has_speed,
+                occupancy_status: ffi.occupancy_status,
+                delay_seconds,
+                has_delay,
+                next_stop_id,
+                next_arrival_time,
+                has_next_stop,
+            });
+        }
+
+        Ok(result)
     }
 
     /// Look up trip update data for a specific trip_id.
@@ -807,6 +1031,37 @@ impl GtfsRtCore {
             has_next_stop: next.is_some(),
         }))
     }
+}
+
+/// Combined vehicle + enrichment returned by `gtfs_rt_get_active_enriched_vehicles`.
+///
+/// Merges `FFIVehicle` fields with the `TripUpdateSummary` fields so Swift needs
+/// only a single FFI call per update cycle instead of N×2 calls (one
+/// `gtfs_static_is_trip_active` + one `gtfs_rt_get_trip_update` per vehicle).
+///
+/// Free with `gtfs_rt_free_enriched_vehicles`.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FFIEnrichedVehicle {
+    // ── Core vehicle fields (mirrors FFIVehicle) ─────────────────────────────
+    pub id: *const c_char,
+    pub latitude: f64,
+    pub longitude: f64,
+    pub bearing: f32,
+    pub speed: f32,
+    pub route_id: *const c_char,
+    pub trip_id: *const c_char,
+    pub label: *const c_char,
+    pub timestamp: i64,
+    pub has_bearing: bool,
+    pub has_speed: bool,
+    pub occupancy_status: i32,
+    // ── TripUpdate enrichment fields (mirrors TripUpdateSummary) ─────────────
+    pub delay_seconds: i32,
+    pub has_delay: bool,
+    pub next_stop_id: *const c_char,
+    pub next_arrival_time: i64,
+    pub has_next_stop: bool,
 }
 
 /// Flat summary of a TripUpdate for FFI — avoids exposing arrays across the boundary.
