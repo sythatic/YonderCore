@@ -473,8 +473,8 @@ impl GtfsRtManager {
     /// Convert VehiclePosition to FFI struct.
     /// Filters out stale, canceled, and deleted vehicles before they reach Swift.
     ///
-    /// `feed_header_ts` is the FeedHeader.timestamp from the last parsed feed.
-    /// It is used as a fallback when VehiclePosition.timestamp is absent — the
+    /// `feed_header_ts` is the FeedHeader.Timestamp from the last parsed feed.
+    /// It is used as a fallback when VehiclePosition.Timestamp is absent — the
     /// GTFS-RT spec says: "If this field is not present, use the timestamp from
     /// the feed header." When we rely on the header timestamp we skip the
     /// per-vehicle staleness check, since the header being recent tells us the
@@ -665,7 +665,7 @@ impl GtfsRtCore {
         // ── Step 1: Trip-level delay ────────────────────────────────────────
         // Per spec: "Delay information in StopTimeUpdates take precedent of
         // trip-level delay information." We still try this first because some
-        // feeds do populate it and it may be more current than stop-level data.
+        // feeds do populate it, it may be more current than stop-level data.
         let mut delay_seconds: Option<i32> = tu.delay;
 
         // ── Step 2: Last past StopTimeUpdate with an explicit delay ─────────
@@ -734,6 +734,38 @@ impl GtfsRtCore {
                         .and_then(|e| e.delay)
                         .or_else(|| stu.departure.as_ref().and_then(|e| e.delay))
                 });
+        }
+
+        // ── Fix 2: Plausibility clamp ───────────────────────────────────────
+        // A delay outside ±6 hours is almost certainly a service-day mismatch
+        // (e.g. an overnight train's stop times compared across midnight, or a
+        // stale feed entry from a prior service day). Discard the value so the
+        // UI shows "Status Unknown" rather than e.g. "23h Late / 23h Early".
+        const MAX_PLAUSIBLE_DELAY_SECS: i32 = 6 * 3600;
+        if let Some(d) = delay_seconds {
+            if d.abs() > MAX_PLAUSIBLE_DELAY_SECS {
+                delay_seconds = None;
+            }
+        }
+
+        // ── Fix 3: Cross-check per-stop delay against trip-level delay ──────
+        // When TripUpdate.delay (field 5) is present it represents a
+        // propagated, authoritative trip-level value. If a per-stop delay
+        // (Steps 2/3 above) diverges from it by more than 1 hour, the
+        // per-stop value is likely anchored to the wrong service day.
+        // Fall back to the trip-level delay in that case.
+        if let Some(trip_delay) = tu.delay {
+            match delay_seconds {
+                Some(stop_delay) if (stop_delay - trip_delay).abs() > 3600 => {
+                    delay_seconds = Some(trip_delay);
+                }
+                None => {
+                    // Step 1 was already tried; propagate trip-level delay
+                    // if per-stop extraction produced nothing at all.
+                    delay_seconds = Some(trip_delay);
+                }
+                _ => {}
+            }
         }
 
         let has_delay = delay_seconds.is_some();

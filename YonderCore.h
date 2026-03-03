@@ -121,8 +121,10 @@ void gtfs_rt_free_trip_update(TripUpdateSummary* summary);
 // MARK: - GTFS Static Lookup
 
 /// One HTTP byte-range Swift must fetch from the ZIP.
+/// gtfs_static_feed_eocd() now returns ranges for five files:
+///   "routes.txt", "trips.txt", "stop_times.txt", "stops.txt", "shapes.txt"
 typedef struct {
-    const char* filename;   // "trips.txt" or "routes.txt"
+    const char* filename;
     uint64_t    byte_offset;
     uint64_t    byte_length;
 } GTFSZipRange;
@@ -133,12 +135,20 @@ typedef struct {
     const char* route_name;    // e.g. "Northeast Regional"
 } GTFSStaticResult;
 
-/// Feed the last ~65 KB of the ZIP to parse the central directory.
-/// Returns an array of ranges to fetch; sets *out_count.
-/// Free with gtfs_static_free_ranges().
+/// Feed the last ~256 KB of the ZIP to parse the central directory.
+/// Returns an array of up to five GTFSZipRange entries (one per needed file);
+/// sets *out_count. Free with gtfs_static_free_ranges().
 GTFSZipRange* gtfs_static_feed_eocd(const uint8_t* data, size_t data_len, size_t* out_count);
 
-/// Feed decompressed bytes for "trips.txt" or "routes.txt" (starting at local header).
+/// Feed raw bytes for one file entry (starting at the local ZIP header).
+///
+/// Accepted filenames and required feed order:
+///   gtfs_static_feed_file("routes.txt",     data, len)   // any order
+///   gtfs_static_feed_file("trips.txt",      data, len)   // any order
+///   gtfs_static_feed_file("stops.txt",      data, len)   // MUST precede stop_times.txt
+///   gtfs_static_feed_file("stop_times.txt", data, len)   // requires stops.txt loaded
+///   gtfs_static_feed_file("shapes.txt",     data, len)   // any order
+///
 /// Returns 0 on success, -1 on error.
 int32_t gtfs_static_feed_file(const char* filename, const uint8_t* data, size_t data_len);
 
@@ -154,13 +164,49 @@ void gtfs_static_free_ranges(GTFSZipRange* ranges, size_t count);
 /// Returns 1 if static data is fully loaded (routes + trips + stop_times).
 int32_t gtfs_static_is_loaded(void);
 
-/// Returns 1 if `trip_id` is scheduled to be active at `now_unix` (Unix timestamp).
+/// Returns 1 if `trip_id` is scheduled to be active at `now_eastern` (Unix timestamp).
 /// Returns 0 if pre-departure, completed, or not found in static data.
 /// Returns 1 (pass-through) if stop_times haven't loaded yet, so no vehicles
 /// are incorrectly hidden during the initial load.
-int32_t gtfs_static_is_trip_active(const char* trip_id, int64_t now_unix);
+///
+/// now_eastern = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
+int32_t gtfs_static_is_trip_active(const char* trip_id, int64_t now_eastern);
 
-/// Clear all loaded static data.
+/// Clear all loaded static data (routes, trips, stop_times, stops, shapes).
 void gtfs_static_reset(void);
+
+
+// MARK: - GTFS Shape Interpolation
+
+/// Smooth interpolated vehicle position computed from shapes.txt schedule.
+/// Returned by value — no heap allocation, no free needed.
+typedef struct {
+    double  lat;
+    double  lon;
+    /// 1 = valid interpolated position; use lat/lon.
+    /// 0 = shape data unavailable (trip has no shape, or data not yet loaded);
+    ///     fall back to the raw GPS lat/lon from the GTFS-RT feed.
+    int32_t is_valid;
+} InterpolatedPosition;
+
+/// Compute a smooth interpolated position for trip_id at now_eastern.
+///
+/// now_eastern = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
+///
+/// Returns is_valid = 1 on success. Returns is_valid = 0 when shape data is
+/// unavailable — approximately 40% of Amtrak trips (Thruway buses, connecting
+/// services) have no published shape polyline and will always return 0.
+///
+/// Timelines are built once per trip and cached; subsequent calls are O(log n).
+/// Returned by value on the stack — no gtfs_free_* call is needed.
+InterpolatedPosition gtfs_interpolate_position(const char* trip_id, int64_t now_eastern);
+
+/// Returns 1 when shape interpolation data is fully loaded and
+/// gtfs_interpolate_position() can return meaningful results.
+/// Returns 0 while shapes.txt, stops.txt, or stop_times.txt are still loading.
+///
+/// Check this before deciding whether to use interpolated positions or fall
+/// back to the raw GPS lat/lon from the GTFS-RT feed.
+int32_t gtfs_interpolation_is_ready(void);
 
 #endif /* YonderCore_h */
