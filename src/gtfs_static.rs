@@ -377,8 +377,14 @@ fn build_timeline(shape: &[ShapePoint], seq: &TripStopSequence) -> TripShapeTime
 
 /// Query the interpolated (lat, lon) at `secs_from_midnight`.
 ///
-/// Clamps to the shape endpoints if the time is before the first stop or after
-/// the last stop. Returns `None` only for an empty shape.
+/// Returns `None` for an empty shape or when `secs` falls outside the trip's
+/// scheduled window (before first stop or after last stop). The caller should
+/// fall back to the raw GPS coordinate from the GTFS-RT feed in that case.
+///
+/// Note: the `<=`/`>=` clamp behavior was intentionally removed. Clamping
+/// caused every pre-departure and post-arrival train to snap to its terminal
+/// station, stacking dozens of annotations on the same pixel and making them
+/// appear to vanish from the map.
 fn query_position(timeline: &TripShapeTimeline, secs: i64) -> Option<(f64, f64)> {
     let times  = &timeline.time_at_point;
     let points = &timeline.points;
@@ -386,8 +392,9 @@ fn query_position(timeline: &TripShapeTimeline, secs: i64) -> Option<(f64, f64)>
 
     let last = points.len() - 1;
 
-    if secs <= times[0]    { let p = &points[0];    return Some((p.lat, p.lon)); }
-    if secs >= times[last] { let p = &points[last]; return Some((p.lat, p.lon)); }
+    // Return None (→ fall back to raw GPS) when outside the scheduled window.
+    if secs < times[0]    { return None; }
+    if secs > times[last] { return None; }
 
     // Binary-search for the two shape-point indices that bracket `secs`.
     // .unwrap_or_else replaces the equivalent match { Ok(i) => i, Err(i) => i.saturating_sub(1) }:
