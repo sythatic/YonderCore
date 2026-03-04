@@ -436,7 +436,7 @@ impl GtfsRtManager {
                 let lon = pos.longitude as f64;
                 // Coordinate validity is enforced inside vehicle_to_ffi (check 0),
                 // but guard here too so the bounding-box test never runs on garbage values.
-                if !lat.is_finite() || !lon.is_finite() || (lat == 0.0 && lon == 0.0) {
+                if !lat.is_finite() || !lon.is_finite() {
                     return None;
                 }
                 if lat >= min_lat && lat <= max_lat && lon >= min_lon && lon <= max_lon {
@@ -609,17 +609,18 @@ impl GtfsRtManager {
     fn vehicle_to_ffi(&self, vehicle: &VehiclePosition, feed_header_ts: u64) -> Option<FFIVehicle> {
         let pos = vehicle.position.as_ref()?;
 
-        // 0. Reject invalid GPS coordinates before any other processing.
+        // 0. Coordinate sanity check.
         //
-        //    Feeds occasionally emit error-state positions of exactly (0.0, 0.0)
-        //    ("null island") when a GPS fix is unavailable, or values that are
-        //    out of the WGS-84 valid range. Both cause "jumping" train icons on
-        //    the map and must be filtered at the source.
+        //    Reject IEEE 754 non-finite values (NaN / ±Inf) and coordinates
+        //    outside the WGS-84 valid range — these are malformed protobuf
+        //    values that would cause undefined map rendering.
         //
-        //    Valid WGS-84: latitude ∈ [-90, 90], longitude ∈ [-180, 180].
-        //    We also reject NaN and ±Inf (IEEE 754 edge cases prost may produce
-        //    from malformed float wire values) and the exact (0.0, 0.0) pair
-        //    which is Amtrak's sentinel for "no GPS fix".
+        //    Do NOT reject (0.0, 0.0) here.  Amtrak uses this as a "no GPS fix"
+        //    sentinel, but the vehicle is still real and active.  Swift detects
+        //    lat == 0 && lon == 0 and falls back to gtfs_interpolate_position
+        //    (if shapes are loaded) or hides the icon gracefully.  Dropping the
+        //    vehicle here causes live trains to vanish from the map whenever they
+        //    pass through a cellular dead-zone.
         let lat = pos.latitude;
         let lon = pos.longitude;
         if !lat.is_finite()
@@ -628,7 +629,6 @@ impl GtfsRtManager {
             || lat > 90.0
             || lon < -180.0
             || lon > 180.0
-            || (lat == 0.0 && lon == 0.0)
         {
             return None;
         }
@@ -761,23 +761,21 @@ impl GtfsRtCore {
             .vehicle_count())
     }
 
-    /// Return active vehicles, already enriched with TripUpdate data.
+    /// Return all vehicles from the RT VehiclePositions feed, enriched with
+    /// TripUpdate (delay / next-stop) data where available.
     ///
-    /// `now_eastern` is the current Unix timestamp shifted by the Eastern Time
-    /// UTC offset (DST-aware): `now_unix + TimeZone("America/New_York").secondsFromGMT(now)`.
-    /// This value is forwarded to `gtfs_static_is_trip_active` which works in
-    /// Eastern "seconds from midnight".
+    /// `now_eastern` is retained in the signature for API compatibility but is
+    /// no longer used to gate vehicles.  Every vehicle present in the RT feed
+    /// is included — the RT feed is the authoritative source of truth for what
+    /// is currently moving.  Static schedule windows are intentionally NOT used
+    /// here because they cause live trains to disappear due to timezone edge
+    /// cases, unusual service days, and trip_id prefix mismatches between the
+    /// RT and static feeds.
     ///
-    /// Only vehicles whose trip passes the schedule-window gate are included.
-    /// The gate returns 1 (pass) while stop_times are still loading, so no
-    /// vehicles are incorrectly hidden during startup.
-    ///
-    /// The result is a single lock acquisition + a single heap allocation,
-    /// replacing the previous Swift pattern of N×`gtfs_static_is_trip_active`
-    /// calls followed by N×`gtfs_rt_get_trip_update` calls.
-    pub fn get_active_enriched_vehicles(&self, now_eastern: i64) -> Result<Vec<FFIEnrichedVehicle>, String> {
-        use crate::gtfs_static_is_trip_active;
-
+    /// Vehicles with (lat == 0, lon == 0) are passed through with those
+    /// coordinates intact; Swift should detect this sentinel and fall back to
+    /// gtfs_interpolate_position or hide the icon.
+    pub fn get_active_enriched_vehicles(&self, _now_eastern: i64) -> Result<Vec<FFIEnrichedVehicle>, String> {
         let mgr = self
             .manager
             .lock()
@@ -794,33 +792,20 @@ impl GtfsRtCore {
                 None => continue,
             };
 
-            // Step 2 — schedule-window filter via existing Rust function.
-            // Safety: ffi.trip_id is either null or a valid CString we just
-            // created inside vehicle_to_ffi; we consume it below regardless.
+            // Step 2 — extract trip_id for TripUpdate enrichment.
+            // Note: we intentionally do NOT call gtfs_static_is_trip_active here.
+            // If a vehicle is present in the RT VehiclePositions feed it is by
+            // definition active. Suppressing it based on static schedule windows
+            // causes live trains to disappear due to timezone edge cases, unusual
+            // service days/trip_id prefix mismatches between the RT and static feeds.
+            // The static gate belongs only in search/timetable UIs that
+            // need to show scheduled-but-not-yet-departed trains, not on the map.
             let trip_id_cstr: Option<&CStr> = if ffi.trip_id.is_null() {
                 None
             } else {
                 // SAFETY: pointer was just produced by CString::into_raw() in vehicle_to_ffi.
                 Some(unsafe { CStr::from_ptr(ffi.trip_id) })
             };
-
-            let is_active = if trip_id_cstr.is_some() {
-                // gtfs_static_is_trip_active is a safe Rust pub extern "C" fn.
-                gtfs_static_is_trip_active(ffi.trip_id, now_eastern) == 1
-            } else {
-                true // No trip_id → cannot filter; let it through
-            };
-
-            if !is_active {
-                // Free strings allocated by vehicle_to_ffi before skipping.
-                unsafe {
-                    if !ffi.id.is_null() { let _ = CString::from_raw(ffi.id as *mut _); }
-                    if !ffi.route_id.is_null() { let _ = CString::from_raw(ffi.route_id as *mut _); }
-                    if !ffi.trip_id.is_null() { let _ = CString::from_raw(ffi.trip_id as *mut _); }
-                    if !ffi.label.is_null() { let _ = CString::from_raw(ffi.label as *mut _); }
-                }
-                continue;
-            }
 
             // Step 3 — enrich with TripUpdate data (reuse the existing logic).
             let (delay_seconds, has_delay, next_stop_id, next_arrival_time, has_next_stop) =
