@@ -795,10 +795,10 @@ impl GtfsRtCore {
             // Step 2 — extract trip_id for TripUpdate enrichment.
             // Note: we intentionally do NOT call gtfs_static_is_trip_active here.
             // If a vehicle is present in the RT VehiclePositions feed it is by
-            // definition active. Suppressing it based on static schedule windows
+            // definition active — suppressing it based on static schedule windows
             // causes live trains to disappear due to timezone edge cases, unusual
-            // service days/trip_id prefix mismatches between the RT and static feeds.
-            // The static gate belongs only in search/timetable UIs that
+            // service days, or trip_id prefix mismatches between the RT and static
+            // feeds.  The static gate belongs only in search/timetable UIs that
             // need to show scheduled-but-not-yet-departed trains, not on the map.
             let trip_id_cstr: Option<&CStr> = if ffi.trip_id.is_null() {
                 None
