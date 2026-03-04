@@ -397,6 +397,22 @@ pub extern "C" fn free_rust_string(ptr: *mut c_char) {
 
 // MARK: - Helper Functions for FFI
 
+/// Convert a raw C string pointer to a `&str` borrow.
+///
+/// Returns `None` when the pointer is null or the bytes are not valid UTF-8,
+/// allowing call sites to avoid repeating the same five-line match block.
+///
+/// # Safety
+/// `ptr` must either be null or point to a null-terminated C string that remains
+/// valid for the duration of the returned borrow.
+#[inline]
+unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    CStr::from_ptr(ptr).to_str().ok()
+}
+
 /// Helper function to convert stops to C string array
 /// Returns NULL on error, cleaning up any allocated strings
 unsafe fn stops_to_c_string_array(stops: &[GTFSStop], out_count: *mut usize) -> *mut *mut c_char {
@@ -544,6 +560,62 @@ pub extern "C" fn stops_db_count(db: *const StopsDatabase) -> usize {
     }
 }
 
+/// Find the single nearest stop to (lat, lon) using the R-tree spatial index.
+///
+/// Uses the same bounding-box + Haversine approach as `stops_db_find_near` but
+/// returns only the single closest stop, avoiding a full deserialize-all on the
+/// Swift side. On success sets `*out_count` = 1 and returns a 1-element `char**`
+/// array in the same pipe-delimited format as `stops_db_find_near`.
+/// Returns NULL with `*out_count` = 0 if no stops are loaded or coordinates are invalid.
+/// Free with `stops_db_free_results`.
+#[no_mangle]
+pub extern "C" fn stops_db_find_nearest(
+    db: *const StopsDatabase,
+    lat: f64,
+    lon: f64,
+    out_count: *mut usize,
+) -> *mut *mut c_char {
+    if db.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        let db = &*db;
+
+        // Validate coordinates
+        if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 {
+            *out_count = 0;
+            return std::ptr::null_mut();
+        }
+
+        let inner = match db.inner.read() {
+            Ok(guard) => guard,
+            Err(_) => {
+                *out_count = 0;
+                return std::ptr::null_mut();
+            }
+        };
+
+        if inner.stops.is_empty() {
+            *out_count = 0;
+            return std::ptr::null_mut();
+        }
+
+        // Use nearest_neighbor from the R-tree — O(log n), no radius needed.
+        let nearest_point = inner.spatial_index.nearest_neighbor(&[lon, lat]);
+
+        let stop = match nearest_point {
+            Some(p) => &inner.stops[p.data],
+            None => {
+                *out_count = 0;
+                return std::ptr::null_mut();
+            }
+        };
+
+        stops_to_c_string_array(std::slice::from_ref(stop), out_count)
+    }
+}
+
 /// Find a single stop by its stop_id. Uses the O(1) HashMap index.
 /// Returns a single-element `char**` array (same format as `stops_db_find_near`)
 /// with `*out_count` set to 1, or NULL with `*out_count` = 0 if not found.
@@ -561,12 +633,9 @@ pub extern "C" fn stops_db_find_by_id(
     unsafe {
         let db = &*db;
 
-        let id_str = match CStr::from_ptr(stop_id).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                *out_count = 0;
-                return std::ptr::null_mut();
-            }
+        let Some(id_str) = cstr_to_str(stop_id) else {
+            *out_count = 0;
+            return std::ptr::null_mut();
         };
 
         match db.find_by_id(id_str) {
@@ -595,12 +664,9 @@ pub extern "C" fn stops_db_find_by_provider(
     unsafe {
         let db = &*db;
 
-        let provider_str = match CStr::from_ptr(provider).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                *out_count = 0;
-                return std::ptr::null_mut();
-            }
+        let Some(provider_str) = cstr_to_str(provider) else {
+            *out_count = 0;
+            return std::ptr::null_mut();
         };
 
         match db.get_all() {
@@ -996,86 +1062,8 @@ pub extern "C" fn tile_cache_is_negative(
         if cache.is_negative_cache(key) { 1 } else { 0 }
     }
 }
+
 // MARK: - GTFS-RT FFI Functions
-
-/// Get active vehicles, pre-filtered by schedule window and pre-enriched with
-/// TripUpdate data (delay + next stop).
-///
-/// `now_eastern` must be the current Unix timestamp shifted by the Eastern Time
-/// UTC offset (DST-aware):
-///   `now_unix + TimeZone("America/New_York").secondsFromGMT(now)`
-///
-/// This replaces the previous Swift loop that called `gtfs_static_is_trip_active`
-/// and `gtfs_rt_get_trip_update` individually for each vehicle — reducing N×2
-/// FFI crossings per update cycle to a single call.
-///
-/// Returns a pointer to a heap-allocated array of `FFIEnrichedVehicle`.
-/// Sets `*out_count` to the number of vehicles.
-/// Returns NULL when there are no active vehicles.
-/// Free with `gtfs_rt_free_enriched_vehicles`.
-#[no_mangle]
-pub extern "C" fn gtfs_rt_get_active_enriched_vehicles(
-    core: *const GtfsRtCore,
-    now_eastern: i64,
-    out_count: *mut usize,
-) -> *mut FFIEnrichedVehicle {
-    if core.is_null() || out_count.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    unsafe {
-        let core = &*core;
-
-        let vehicles = match core.get_active_enriched_vehicles(now_eastern) {
-            Ok(v) => v,
-            Err(_) => {
-                *out_count = 0;
-                return std::ptr::null_mut();
-            }
-        };
-
-        *out_count = vehicles.len();
-
-        if vehicles.is_empty() {
-            return std::ptr::null_mut();
-        }
-
-        let boxed = vehicles.into_boxed_slice();
-        Box::into_raw(boxed) as *mut FFIEnrichedVehicle
-    }
-}
-
-/// Free the array returned by `gtfs_rt_get_active_enriched_vehicles`.
-#[no_mangle]
-pub extern "C" fn gtfs_rt_free_enriched_vehicles(vehicles: *mut FFIEnrichedVehicle, count: usize) {
-    if vehicles.is_null() || count == 0 {
-        return;
-    }
-
-    unsafe {
-        let vehicles_slice = std::slice::from_raw_parts(vehicles, count);
-
-        for vehicle in vehicles_slice.iter() {
-            if !vehicle.id.is_null() {
-                let _ = CString::from_raw(vehicle.id as *mut c_char);
-            }
-            if !vehicle.route_id.is_null() {
-                let _ = CString::from_raw(vehicle.route_id as *mut c_char);
-            }
-            if !vehicle.trip_id.is_null() {
-                let _ = CString::from_raw(vehicle.trip_id as *mut c_char);
-            }
-            if !vehicle.label.is_null() {
-                let _ = CString::from_raw(vehicle.label as *mut c_char);
-            }
-            if !vehicle.next_stop_id.is_null() {
-                let _ = CString::from_raw(vehicle.next_stop_id as *mut c_char);
-            }
-        }
-
-        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(vehicles, count));
-    }
-}
 
 /// Create a new GTFS-RT manager
 #[no_mangle]
@@ -1212,7 +1200,6 @@ pub extern "C" fn gtfs_rt_get_trip_update(
 
     unsafe {
         let core = &*core;
-        // Use CStr (no underscore) as imported on line 1
         let trip_id_str = match CStr::from_ptr(trip_id).to_str() {
             Ok(s) => s,
             Err(_) => return std::ptr::null_mut(),
@@ -1240,5 +1227,90 @@ pub extern "C" fn gtfs_rt_free_trip_update(summary: *mut TripUpdateSummary) {
             let _ = CString::from_raw(s.next_stop_id as *mut c_char);
         }
         let _ = Box::from_raw(summary);
+    }
+}
+
+// MARK: - GTFS-RT Enriched Vehicle FFI Functions
+
+/// Return all active vehicles enriched with TripUpdate data in a single FFI call.
+///
+/// `now_eastern` = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
+/// Only vehicles whose trip passes the schedule-window gate are included.
+/// The gate returns 1 (pass) while stop_times are still loading, so no vehicles
+/// are incorrectly hidden during startup.
+///
+/// Replaces the previous pattern of N×gtfs_static_is_trip_active +
+/// N×gtfs_rt_get_trip_update calls per update cycle.
+///
+/// Free the result with gtfs_rt_free_enriched_vehicles().
+#[no_mangle]
+pub extern "C" fn gtfs_rt_get_active_enriched_vehicles(
+    core: *const GtfsRtCore,
+    now_eastern: i64,
+    out_count: *mut usize,
+) -> *mut FFIEnrichedVehicle {
+    if core.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    unsafe {
+        let core = &*core;
+
+        let vehicles = match core.get_active_enriched_vehicles(now_eastern) {
+            Ok(v) => v,
+            Err(_) => {
+                *out_count = 0;
+                return std::ptr::null_mut();
+            }
+        };
+
+        *out_count = vehicles.len();
+
+        if vehicles.is_empty() {
+            return std::ptr::null_mut();
+        }
+
+        let boxed = vehicles.into_boxed_slice();
+        Box::into_raw(boxed) as *mut FFIEnrichedVehicle
+    }
+}
+
+/// Free the array returned by gtfs_rt_get_active_enriched_vehicles.
+///
+/// Frees every heap-allocated C string field (id, route_id, trip_id, label,
+/// next_stop_id) before dropping the slice, mirroring the allocation performed
+/// inside GtfsRtCore::get_active_enriched_vehicles → vehicle_to_ffi /
+/// get_trip_update_inner.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_free_enriched_vehicles(
+    vehicles: *mut FFIEnrichedVehicle,
+    count: usize,
+) {
+    if vehicles.is_null() || count == 0 {
+        return;
+    }
+
+    unsafe {
+        let slice = std::slice::from_raw_parts(vehicles, count);
+
+        for v in slice.iter() {
+            if !v.id.is_null() {
+                let _ = CString::from_raw(v.id as *mut c_char);
+            }
+            if !v.route_id.is_null() {
+                let _ = CString::from_raw(v.route_id as *mut c_char);
+            }
+            if !v.trip_id.is_null() {
+                let _ = CString::from_raw(v.trip_id as *mut c_char);
+            }
+            if !v.label.is_null() {
+                let _ = CString::from_raw(v.label as *mut c_char);
+            }
+            if !v.next_stop_id.is_null() {
+                let _ = CString::from_raw(v.next_stop_id as *mut c_char);
+            }
+        }
+
+        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(vehicles, count));
     }
 }

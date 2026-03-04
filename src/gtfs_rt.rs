@@ -1,5 +1,5 @@
 use prost::Message;
-use std::ffi::{CString, c_char};
+use std::ffi::{CStr, CString, c_char};
 
 // MARK: - Protobuf Message Definitions
 // Matches the official GTFS-RT spec:
@@ -797,16 +797,16 @@ impl GtfsRtCore {
             // Step 2 — schedule-window filter via existing Rust function.
             // Safety: ffi.trip_id is either null or a valid CString we just
             // created inside vehicle_to_ffi; we consume it below regardless.
-            let trip_id_cstr: Option<&std::ffi::CStr> = if ffi.trip_id.is_null() {
+            let trip_id_cstr: Option<&CStr> = if ffi.trip_id.is_null() {
                 None
             } else {
                 // SAFETY: pointer was just produced by CString::into_raw() in vehicle_to_ffi.
-                Some(unsafe { std::ffi::CStr::from_ptr(ffi.trip_id) })
+                Some(unsafe { CStr::from_ptr(ffi.trip_id) })
             };
 
-            let is_active = if let Some(tid) = trip_id_cstr {
-                // SAFETY: gtfs_static_is_trip_active expects a valid C string pointer.
-                unsafe { gtfs_static_is_trip_active(ffi.trip_id, now_eastern) == 1 }
+            let is_active = if trip_id_cstr.is_some() {
+                // gtfs_static_is_trip_active is a safe Rust pub extern "C" fn.
+                gtfs_static_is_trip_active(ffi.trip_id, now_eastern) == 1
             } else {
                 true // No trip_id → cannot filter; let it through
             };
@@ -814,10 +814,10 @@ impl GtfsRtCore {
             if !is_active {
                 // Free strings allocated by vehicle_to_ffi before skipping.
                 unsafe {
-                    if !ffi.id.is_null() { let _ = std::ffi::CString::from_raw(ffi.id as *mut _); }
-                    if !ffi.route_id.is_null() { let _ = std::ffi::CString::from_raw(ffi.route_id as *mut _); }
-                    if !ffi.trip_id.is_null() { let _ = std::ffi::CString::from_raw(ffi.trip_id as *mut _); }
-                    if !ffi.label.is_null() { let _ = std::ffi::CString::from_raw(ffi.label as *mut _); }
+                    if !ffi.id.is_null() { let _ = CString::from_raw(ffi.id as *mut _); }
+                    if !ffi.route_id.is_null() { let _ = CString::from_raw(ffi.route_id as *mut _); }
+                    if !ffi.trip_id.is_null() { let _ = CString::from_raw(ffi.trip_id as *mut _); }
+                    if !ffi.label.is_null() { let _ = CString::from_raw(ffi.label as *mut _); }
                 }
                 continue;
             }
@@ -826,10 +826,8 @@ impl GtfsRtCore {
             let (delay_seconds, has_delay, next_stop_id, next_arrival_time, has_next_stop) =
                 if let Some(tid) = trip_id_cstr {
                     let tid_str = tid.to_str().unwrap_or("");
-                    match mgr.get_trip_update_inner(tid_str) {
-                        Some(tu) => tu,
-                        None => (0, false, std::ptr::null(), 0, false),
-                    }
+                    mgr.get_trip_update_inner(tid_str)
+                        .unwrap_or((0, false, std::ptr::null(), 0, false))
                 } else {
                     (0, false, std::ptr::null(), 0, false)
                 };
@@ -877,158 +875,18 @@ impl GtfsRtCore {
             .lock()
             .map_err(|_| "Failed to acquire lock".to_string())?;
 
-        let Some(tu) = mgr.find_trip_update(trip_id) else {
+        let Some((delay_seconds, has_delay, next_stop_id, next_arrival_time, has_next_stop)) =
+            mgr.get_trip_update_inner(trip_id)
+        else {
             return Ok(None);
         };
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // ── Step 1: Trip-level delay ────────────────────────────────────────
-        // Per spec: "Delay information in StopTimeUpdates take precedent of
-        // trip-level delay information." We still try this first because some
-        // feeds do populate it, it may be more current than stop-level data.
-        let mut delay_seconds: Option<i32> = tu.delay;
-
-        // ── Step 2: Last past StopTimeUpdate with an explicit delay ─────────
-        // "Past" means the predicted departure (or arrival) time is <= now.
-        // We want the *last* such stop because it's the most recently observed
-        // delay measurement — i.e., what the train is doing right now.
-        if delay_seconds.is_none() {
-            delay_seconds = tu
-                .stop_time_update
-                .iter()
-                .filter(|stu| {
-                    // Not a skipped or no-data stop
-                    let rel = stu.schedule_relationship.unwrap_or(
-                        stop_time_schedule_relationship::SCHEDULED,
-                    );
-                    if rel == stop_time_schedule_relationship::SKIPPED
-                        || rel == stop_time_schedule_relationship::NO_DATA
-                    {
-                        return false;
-                    }
-                    // The stop's predicted time must be in the past
-                    let t = stu
-                        .departure
-                        .as_ref()
-                        .and_then(|e| e.time)
-                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.time))
-                        .unwrap_or(i64::MAX);
-                    t <= now
-                })
-                .filter_map(|stu| {
-                    // Prefer departure delay; fall back to arrival delay
-                    stu.departure
-                        .as_ref()
-                        .and_then(|e| e.delay)
-                        .or_else(|| stu.arrival.as_ref().and_then(|e| e.delay))
-                })
-                .last();
-        }
-
-        // ── Step 3: First future StopTimeUpdate's delay ─────────────────────
-        // Covers trains not yet departed or when past stops lack delay values.
-        if delay_seconds.is_none() {
-            delay_seconds = tu
-                .stop_time_update
-                .iter()
-                .filter(|stu| {
-                    let rel = stu.schedule_relationship.unwrap_or(
-                        stop_time_schedule_relationship::SCHEDULED,
-                    );
-                    if rel == stop_time_schedule_relationship::SKIPPED
-                        || rel == stop_time_schedule_relationship::NO_DATA
-                    {
-                        return false;
-                    }
-                    let t = stu
-                        .arrival
-                        .as_ref()
-                        .and_then(|e| e.time)
-                        .or_else(|| stu.departure.as_ref().and_then(|e| e.time))
-                        .unwrap_or(0);
-                    t > now
-                })
-                .find_map(|stu| {
-                    stu.arrival
-                        .as_ref()
-                        .and_then(|e| e.delay)
-                        .or_else(|| stu.departure.as_ref().and_then(|e| e.delay))
-                });
-        }
-
-        // ── Fix 2: Plausibility clamp ───────────────────────────────────────
-        // A delay outside ±6 hours is almost certainly a service-day mismatch
-        // (e.g. an overnight train's stop times compared across midnight, or a
-        // stale feed entry from a prior service day). Discard the value so the
-        // UI shows "Status Unknown" rather than e.g. "23h Late / 23h Early".
-        const MAX_PLAUSIBLE_DELAY_SECS: i32 = 6 * 3600;
-        if let Some(d) = delay_seconds {
-            if d.abs() > MAX_PLAUSIBLE_DELAY_SECS {
-                delay_seconds = None;
-            }
-        }
-
-        // ── Fix 3: Cross-check per-stop delay against trip-level delay ──────
-        // When TripUpdate.delay (field 5) is present it represents a
-        // propagated, authoritative trip-level value. If a per-stop delay
-        // (Steps 2/3 above) diverges from it by more than 1 hour, the
-        // per-stop value is likely anchored to the wrong service day.
-        // Fall back to the trip-level delay in that case.
-        if let Some(trip_delay) = tu.delay {
-            match delay_seconds {
-                Some(stop_delay) if (stop_delay - trip_delay).abs() > 3600 => {
-                    delay_seconds = Some(trip_delay);
-                }
-                None => {
-                    // Step 1 was already tried; propagate trip-level delay
-                    // if per-stop extraction produced nothing at all.
-                    delay_seconds = Some(trip_delay);
-                }
-                _ => {}
-            }
-        }
-
-        let has_delay = delay_seconds.is_some();
-
-        // ── Next stop ───────────────────────────────────────────────────────
-        // First future stop, excluding SKIPPED and NO_DATA entries so we
-        // never direct a passenger to a stop the train won't serve.
-        let next = tu.stop_time_update.iter().find(|stu| {
-            let rel = stu
-                .schedule_relationship
-                .unwrap_or(stop_time_schedule_relationship::SCHEDULED);
-            if rel == stop_time_schedule_relationship::SKIPPED
-                || rel == stop_time_schedule_relationship::NO_DATA
-            {
-                return false;
-            }
-            // A stop is "upcoming" if its departure or arrival time is in the future.
-            let t = stu
-                .departure
-                .as_ref()
-                .and_then(|e| e.time)
-                .or_else(|| stu.arrival.as_ref().and_then(|e| e.time));
-            t.map(|ts| ts > now).unwrap_or(false)
-        });
-
-        let next_stop_id = next
-            .and_then(|s| s.stop_id.as_ref())
-            .and_then(|s| CString::new(s.as_str()).ok());
-
-        let next_arrival_time = next
-            .and_then(|s| s.arrival.as_ref().and_then(|e| e.time))
-            .unwrap_or(0);
-
         Ok(Some(TripUpdateSummary {
-            delay_seconds: delay_seconds.unwrap_or(0),
+            delay_seconds,
             has_delay,
-            next_stop_id: next_stop_id.map_or(std::ptr::null(), |s| s.into_raw()),
+            next_stop_id,
             next_arrival_time,
-            has_next_stop: next.is_some(),
+            has_next_stop,
         }))
     }
 }

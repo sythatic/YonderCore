@@ -31,31 +31,6 @@ typedef struct {
 	int32_t occupancy_status;
 } FFIVehicle;
 
-/// Vehicle position merged with TripUpdate enrichment (delay + next stop).
-/// Returned by gtfs_rt_get_active_enriched_vehicles().
-/// Free with gtfs_rt_free_enriched_vehicles().
-typedef struct {
-	// ── Core vehicle fields (mirrors FFIVehicle) ─────────────────────────────
-	const char* id;
-	double latitude;
-	double longitude;
-	float bearing;
-	float speed;
-	const char* route_id;
-	const char* trip_id;
-	const char* label;
-	int64_t timestamp;
-	bool has_bearing;
-	bool has_speed;
-	int32_t occupancy_status;
-	// ── TripUpdate enrichment fields ─────────────────────────────────────────
-	int32_t delay_seconds;     // positive = late, negative = early
-	bool has_delay;            // true if delay_seconds is meaningful
-	const char* next_stop_id;  // stop_id of next upcoming stop, or NULL
-	int64_t next_arrival_time; // unix timestamp of predicted arrival (0 = unknown)
-	bool has_next_stop;        // true if next_stop_id/next_arrival_time are populated
-} FFIEnrichedVehicle;
-
 // MARK: - Test Functions
 
 const char* hello_from_rust(void);
@@ -67,6 +42,9 @@ StopsDatabase* stops_db_new(void);
 int32_t stops_db_load_csv(StopsDatabase* db, const char* path);
 char** stops_db_find_near(const StopsDatabase* db, double lat, double lon, double radius_meters, size_t* out_count);
 char** stops_db_get_all(const StopsDatabase* db, size_t* out_count);
+/// Find the single nearest stop to (lat, lon) using the R-tree (O(log n)).
+/// Returns a 1-element char** or NULL. Free with stops_db_free_results.
+char** stops_db_find_nearest(const StopsDatabase* db, double lat, double lon, size_t* out_count);
 /// Find a single stop by stop_id using the O(1) HashMap index.
 /// Returns a 1-element char** (same format as stops_db_find_near), or NULL if not found.
 /// Free with stops_db_free_results.
@@ -114,28 +92,50 @@ int32_t gtfs_rt_parse(GtfsRtCore* core, const uint8_t* data, size_t data_len);
 /// out_count is set to the number of vehicles
 FFIVehicle* gtfs_rt_get_vehicles(const GtfsRtCore* core, size_t* out_count);
 
-/// Get active vehicles pre-filtered by schedule window and pre-enriched with
-/// TripUpdate data (delay + next stop).
-///
-/// now_eastern = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
-///
-/// This replaces the previous pattern of calling gtfs_static_is_trip_active and
-/// gtfs_rt_get_trip_update individually for each vehicle, reducing N*2 FFI
-/// crossings per update cycle to a single call.
-///
-/// Returns pointer to array of FFIEnrichedVehicle structs, or NULL when empty.
-/// out_count is set to the number of active vehicles.
-/// Free with gtfs_rt_free_enriched_vehicles.
-FFIEnrichedVehicle* gtfs_rt_get_active_enriched_vehicles(const GtfsRtCore* core, int64_t now_eastern, size_t* out_count);
-
-/// Free vehicle array returned by gtfs_rt_get_active_enriched_vehicles
-void gtfs_rt_free_enriched_vehicles(FFIEnrichedVehicle* vehicles, size_t count);
-
 /// Get count of vehicles
 size_t gtfs_rt_vehicle_count(const GtfsRtCore* core);
 
 /// Free vehicle array returned by gtfs_rt_get_vehicles
 void gtfs_rt_free_vehicles(FFIVehicle* vehicles, size_t count);
+
+/// Combined vehicle + TripUpdate enrichment returned by gtfs_rt_get_active_enriched_vehicles.
+/// Free the array with gtfs_rt_free_enriched_vehicles().
+typedef struct {
+    // ── Core vehicle fields (mirrors FFIVehicle) ─────────────────────────────
+    const char* id;
+    double      latitude;
+    double      longitude;
+    float       bearing;
+    float       speed;
+    const char* route_id;
+    const char* trip_id;
+    const char* label;
+    int64_t     timestamp;
+    bool        has_bearing;
+    bool        has_speed;
+    int32_t     occupancy_status;
+    // ── TripUpdate enrichment fields ─────────────────────────────────────────
+    int32_t     delay_seconds;      // positive = late, negative = early
+    bool        has_delay;          // true if delay_seconds is meaningful
+    const char* next_stop_id;       // stop_id of the next upcoming stop, or NULL
+    int64_t     next_arrival_time;  // unix timestamp of predicted arrival (0 = unknown)
+    bool        has_next_stop;      // true if next_stop_id / next_arrival_time are populated
+} FFIEnrichedVehicle;
+
+/// Return all active vehicles enriched with TripUpdate data in a single FFI call.
+///
+/// `now_eastern` = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
+/// Only vehicles whose trip passes the schedule-window gate are included.
+/// out_count is set to the number of vehicles returned.
+/// Free the result with gtfs_rt_free_enriched_vehicles().
+FFIEnrichedVehicle* gtfs_rt_get_active_enriched_vehicles(
+    const GtfsRtCore* core,
+    int64_t           now_eastern,
+    size_t*           out_count
+);
+
+/// Free the array returned by gtfs_rt_get_active_enriched_vehicles.
+void gtfs_rt_free_enriched_vehicles(FFIEnrichedVehicle* vehicles, size_t count);
 
 /// Free GTFS-RT manager
 void gtfs_rt_free(GtfsRtCore* core);
