@@ -1,13 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufWriter, Write};
 use serde::{Serialize, Deserialize};
 use rkyv::{Archive, Serialize as RkyvSerialize, Deserialize as RkyvDeserialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+// NOTE: DefaultHasher is explicitly NOT stable across Rust versions/builds.
+// Using a simple inline FNV-1a instead to guarantee disk cache keys are
+// consistent across app updates.
 
 // MARK: - Core Data Structures
 
@@ -170,11 +171,15 @@ impl CacheStatsSnapshot {
 // MARK: - Optimized Tile Cache Core
 
 /// Memory cache entry
+///
+/// `last_access` uses `AtomicI64` so that `load_tile` can update the LRU
+/// timestamp while holding only a *read* lock on the outer HashMap, rather
+/// than upgrading to a write lock on every cache hit.
 #[derive(Clone)]
 struct MemoryCacheEntry {
     data: Arc<Vec<u8>>,  // Arc for cheap clones
     meta: TileMeta,
-    last_access: i64,
+    last_access: Arc<AtomicI64>,
 }
 
 /// Core tile cache manager - optimized with memory cache and rkyv for zero-copy I/O
@@ -223,11 +228,16 @@ impl TileCacheCore {
             writer.flush()?;
         }
 
-        // Serialize metadata with rkyv (zero-copy format)
+        // Prepend a version byte so future TileMeta layout changes can be
+        // detected on read rather than silently producing garbage data.
+        const META_VERSION: u8 = 1;
         let meta_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("rkyv serialization error: {}", e)))?;
+        let mut versioned = Vec::with_capacity(1 + meta_bytes.len());
+        versioned.push(META_VERSION);
+        versioned.extend_from_slice(&meta_bytes);
 
-        fs::write(&meta_path, &meta_bytes)?;
+        fs::write(&meta_path, &versioned)?;
 
         // Update memory cache
         if let Ok(mut cache) = self.memory_cache.write() {
@@ -241,7 +251,7 @@ impl TileCacheCore {
                 MemoryCacheEntry {
                     data: Arc::new(data.to_vec()),
                     meta: *meta,
-                    last_access: current_timestamp(),
+                    last_access: Arc::new(AtomicI64::new(current_timestamp())),
                 },
             );
         }
@@ -251,18 +261,29 @@ impl TileCacheCore {
 
     /// Load a tile - first check memory cache, then disk
     pub fn load_tile(&self, cache_key: &str) -> Option<CachedTile> {
-        // Check memory cache first
-        if let Ok(mut cache) = self.memory_cache.write() {
-            if let Some(entry) = cache.get_mut(cache_key) {
+        // Check memory cache first with a READ lock.
+        // `last_access` is AtomicI64, so we can update the LRU timestamp
+        // without upgrading to a write lock on every cache hit.
+        if let Ok(cache) = self.memory_cache.read() {
+            if let Some(entry) = cache.get(cache_key) {
                 // Check if expired
                 if entry.meta.is_expired() {
                     self.statistics.record_expired();
-                    cache.remove(cache_key);
+                    // Can't remove here (read lock) — drop the read lock first,
+                    // then acquire write lock to evict. The tile will be re-checked
+                    // below and evicted on the next write-lock opportunity.
+                    drop(cache);
+                    if let Ok(mut write_cache) = self.memory_cache.write() {
+                        // Re-check under write lock to avoid TOCTOU
+                        if write_cache.get(cache_key).map_or(false, |e| e.meta.is_expired()) {
+                            write_cache.remove(cache_key);
+                        }
+                    }
                     return None;
                 }
 
-                // Update last access time
-                entry.last_access = current_timestamp();
+                // Touch LRU timestamp atomically — no write lock needed
+                entry.last_access.store(current_timestamp(), Ordering::Relaxed);
                 self.statistics.record_memory_hit();
 
                 return Some(CachedTile {
@@ -304,7 +325,7 @@ impl TileCacheCore {
                 MemoryCacheEntry {
                     data: Arc::new(data.clone()),
                     meta,
-                    last_access: current_timestamp(),
+                    last_access: Arc::new(AtomicI64::new(current_timestamp())),
                 },
             );
         }
@@ -363,11 +384,15 @@ impl TileCacheCore {
             mapping.insert(cache_key.to_string(), hashed_key);
         }
 
-        // Serialize metadata with rkyv
+        // Serialize metadata with rkyv (versioned — see save_tile)
+        const META_VERSION: u8 = 1;
         let meta_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("rkyv serialization error: {}", e)))?;
+        let mut versioned = Vec::with_capacity(1 + meta_bytes.len());
+        versioned.push(META_VERSION);
+        versioned.extend_from_slice(&meta_bytes);
 
-        fs::write(&meta_path, &meta_bytes)?;
+        fs::write(&meta_path, &versioned)?;
 
         // Update memory cache with empty data
         if let Ok(mut cache) = self.memory_cache.write() {
@@ -380,7 +405,7 @@ impl TileCacheCore {
                 MemoryCacheEntry {
                     data: Arc::new(Vec::new()),
                     meta,
-                    last_access: current_timestamp(),
+                    last_access: Arc::new(AtomicI64::new(current_timestamp())),
                 },
             );
         }
@@ -520,38 +545,54 @@ impl TileCacheCore {
         self.statistics.reset();
     }
 
-    /// Evict least recently used entry from memory cache
+    /// Evict least recently used entry from memory cache.
+    ///
+    /// Called while the write lock on `memory_cache` is already held.
+    /// Also purges the evicted key from `key_mapping` to prevent unbounded growth.
     fn evict_lru_from_memory(&self, cache: &mut HashMap<String, MemoryCacheEntry>) {
         if cache.is_empty() {
             return;
         }
 
-        // Find the entry with the oldest access time
+        // Find the entry with the oldest access time.
+        // O(n) scan is acceptable at our 1,000-entry cap.
         let mut oldest_time = i64::MAX;
         let mut oldest_key: Option<String> = None;
 
         for (key, entry) in cache.iter() {
-            if entry.last_access < oldest_time {
-                oldest_time = entry.last_access;
+            let t = entry.last_access.load(Ordering::Relaxed);
+            if t < oldest_time {
+                oldest_time = t;
                 oldest_key = Some(key.clone());
             }
         }
 
         if let Some(key) = oldest_key {
             cache.remove(&key);
+            // Purge from key_mapping to prevent unbounded memory growth.
+            if let Ok(mut mapping) = self.key_mapping.write() {
+                mapping.remove(&key);
+            }
         }
     }
 
     // MARK: - Private Helpers
 
-    /// Hash cache key for filesystem safety and collision resistance
-    /// Uses first 16 hex chars of hash for reasonable uniqueness
+    /// Hash cache key for filesystem safety and collision resistance.
+    ///
+    /// Uses FNV-1a rather than `DefaultHasher` because `DefaultHasher` is
+    /// explicitly not guaranteed to be stable across Rust versions or builds.
+    /// An unstable hasher would silently orphan the entire disk cache after
+    /// any app update that bumps the Rust toolchain.
     fn hash_cache_key(&self, key: &str) -> String {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Convert to hex string (16 chars = 64 bits of entropy)
+        // FNV-1a 64-bit inline — no extra dependency required
+        const FNV_OFFSET: u64 = 14695981039346656037;
+        const FNV_PRIME: u64 = 1099511628211;
+        let mut hash = FNV_OFFSET;
+        for byte in key.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
         format!("{:016x}", hash)
     }
 
@@ -572,8 +613,18 @@ impl TileCacheCore {
     fn load_metadata_internal(&self, meta_path: &Path) -> Option<TileMeta> {
         let data = fs::read(meta_path).ok()?;
 
+        // Version byte was prepended at write time.
+        // Unknown versions are rejected rather than producing garbage data.
+        const META_VERSION: u8 = 1;
+        let (&version, payload) = data.split_first()?;
+        if version != META_VERSION {
+            // Stale file from an incompatible build — treat as a cache miss.
+            let _ = fs::remove_file(meta_path);
+            return None;
+        }
+
         // Zero-copy deserialization with rkyv using the correct archived type
-        let archived = rkyv::access::<ArchivedTileMeta, rkyv::rancor::Error>(&data).ok()?;
+        let archived = rkyv::access::<ArchivedTileMeta, rkyv::rancor::Error>(payload).ok()?;
 
         // Copy fields from archived data (very cheap - just copying primitive types)
         Some(TileMeta {

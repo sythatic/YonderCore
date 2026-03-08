@@ -445,9 +445,7 @@ unsafe fn stops_to_c_string_array(stops: &[GTFSStop], out_count: *mut usize) -> 
     }
 
     *out_count = result.len();
-    let ptr = result.as_mut_ptr();
-    std::mem::forget(result);
-    ptr
+    Box::into_raw(result.into_boxed_slice()) as *mut *mut c_char
 }
 
 // MARK: - Thread-Safe FFI Interface for StopsDatabase
@@ -540,12 +538,17 @@ pub extern "C" fn stops_db_free_results(results: *mut *mut c_char, count: usize)
     }
 
     unsafe {
-        let results = Vec::from_raw_parts(results, count, count);
-        for ptr in results {
+        // Reconstruct as Box<[*mut c_char]> — the slice length equals the original
+        // boxed-slice capacity, so this round-trip is always safe.
+        let boxed = Box::from_raw(
+            std::ptr::slice_from_raw_parts_mut(results, count)
+        );
+        for ptr in boxed.iter() {
             if !ptr.is_null() {
-                let _ = CString::from_raw(ptr);
+                let _ = CString::from_raw(*ptr);
             }
         }
+        // boxed drops here, freeing the outer array
     }
 }
 
@@ -1277,42 +1280,7 @@ pub extern "C" fn gtfs_rt_get_active_enriched_vehicles(
     }
 }
 
-/// Free the array returned by gtfs_rt_get_active_enriched_vehicles.
-///
-/// Frees every heap-allocated C string field (id, route_id, trip_id, label,
-/// next_stop_id) before dropping the slice, mirroring the allocation performed
-/// inside GtfsRtCore::get_active_enriched_vehicles → vehicle_to_ffi /
-/// get_trip_update_inner.
-#[no_mangle]
-pub extern "C" fn gtfs_rt_free_enriched_vehicles(
-    vehicles: *mut FFIEnrichedVehicle,
-    count: usize,
-) {
-    if vehicles.is_null() || count == 0 {
-        return;
-    }
-
-    unsafe {
-        let slice = std::slice::from_raw_parts(vehicles, count);
-
-        for v in slice.iter() {
-            if !v.id.is_null() {
-                let _ = CString::from_raw(v.id as *mut c_char);
-            }
-            if !v.route_id.is_null() {
-                let _ = CString::from_raw(v.route_id as *mut c_char);
-            }
-            if !v.trip_id.is_null() {
-                let _ = CString::from_raw(v.trip_id as *mut c_char);
-            }
-            if !v.label.is_null() {
-                let _ = CString::from_raw(v.label as *mut c_char);
-            }
-            if !v.next_stop_id.is_null() {
-                let _ = CString::from_raw(v.next_stop_id as *mut c_char);
-            }
-        }
-
-        let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(vehicles, count));
-    }
-}
+// gtfs_rt_free_enriched_vehicles is defined in gtfs_rt.rs (canonical definition
+// with full Safety documentation) and re-exported here via `pub use gtfs_rt::*`.
+// Do NOT add a second definition here — duplicate #[no_mangle] symbols cause
+// linker warnings and undefined behaviour when the linker picks the wrong one.

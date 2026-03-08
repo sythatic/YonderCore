@@ -65,24 +65,43 @@ impl ShapesEditorStore {
 
     /// Parse a shapes.txt CSV (with or without a header row) and replace
     /// the current in-memory store.  Returns the total number of points loaded.
-    fn load(&mut self, csv: &str) -> Result<usize, String> {
+    ///
+    /// Accepts any `BufRead` so the FFI entry point can stream directly from
+    /// a `BufReader<File>` rather than reading the entire file into a `String`
+    /// first.  For a dense national shapes.txt (≈100–200 MB), that halves
+    /// peak RSS: the raw file bytes are never resident alongside the BTreeMap.
+    ///
+    /// # CSV compliance note
+    /// Uses a fast `splitn(5, ',')` parser.  GTFS shape IDs are machine-generated
+    /// identifiers (e.g. `2553_0`, `NEC_NB`) and no real feed uses quoted commas
+    /// in this field, so full RFC-4180 quoting is deliberately not implemented.
+    fn load<R: std::io::BufRead>(&mut self, reader: R) -> Result<usize, String> {
         let mut new_shapes: BTreeMap<String, BTreeMap<u32, (f64, f64)>> = BTreeMap::new();
-        let mut total = 0usize;
+        let mut total      = 0usize;
+        let mut line_no    = 0usize;
+        let mut buf        = String::new();
+        let mut saw_header = false;
+        let mut reader     = reader;
 
-        let mut lines = csv.lines().peekable();
+        loop {
+            buf.clear();
+            let n = reader.read_line(&mut buf)
+                .map_err(|e| format!("line {}: I/O error: {}", line_no + 1, e))?;
+            if n == 0 { break; } // EOF
 
-        // Detect and skip header row — GTFS requires this exact column order
-        // but real-world files sometimes omit it, so we check explicitly.
-        if let Some(&first) = lines.peek() {
-            let low = first.to_ascii_lowercase();
-            if low.contains("shape_id") || low.contains("shape_pt_lat") {
-                lines.next();
-            }
-        }
-
-        for (line_no, line) in lines.enumerate() {
-            let line = line.trim();
+            line_no += 1;
+            let line = buf.trim();
             if line.is_empty() { continue; }
+
+            // Detect and skip exactly the first header row.
+            if !saw_header {
+                let low = line.to_ascii_lowercase();
+                saw_header = true;
+                if low.contains("shape_id") || low.contains("shape_pt_lat") {
+                    continue; // skip header, proceed to next line
+                }
+                // No header — fall through and parse this line as data.
+            }
 
             // Fast split — GTFS shapes.txt has exactly 4 columns:
             //   shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence
@@ -90,27 +109,27 @@ impl ShapesEditorStore {
             let mut cols = line.splitn(5, ',');
             let shape_id = match cols.next() {
                 Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_id", line_no + 2)),
+                None    => return Err(format!("line {}: missing shape_id", line_no)),
             };
             let lat_str = match cols.next() {
                 Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_pt_lat", line_no + 2)),
+                None    => return Err(format!("line {}: missing shape_pt_lat", line_no)),
             };
             let lon_str = match cols.next() {
                 Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_pt_lon", line_no + 2)),
+                None    => return Err(format!("line {}: missing shape_pt_lon", line_no)),
             };
             let seq_str = match cols.next() {
                 Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_pt_sequence", line_no + 2)),
+                None    => return Err(format!("line {}: missing shape_pt_sequence", line_no)),
             };
 
             let lat: f64 = lat_str.parse()
-                .map_err(|_| format!("line {}: invalid lat '{}'", line_no + 2, lat_str))?;
+                .map_err(|_| format!("line {}: invalid lat '{}'", line_no, lat_str))?;
             let lon: f64 = lon_str.parse()
-                .map_err(|_| format!("line {}: invalid lon '{}'", line_no + 2, lon_str))?;
+                .map_err(|_| format!("line {}: invalid lon '{}'", line_no, lon_str))?;
             let seq: u32 = seq_str.parse()
-                .map_err(|_| format!("line {}: invalid seq '{}'", line_no + 2, seq_str))?;
+                .map_err(|_| format!("line {}: invalid seq '{}'", line_no, seq_str))?;
 
             new_shapes
                 .entry(shape_id.to_string())
@@ -191,9 +210,17 @@ impl ShapesEditorStore {
     /// Insert a new point with `sequence = after_sequence + 1`.
     /// All existing points in the same shape with sequence ≥ the new sequence
     /// are renumbered +1 so the polyline order stays contiguous.
+    ///
+    /// Returns false if `after_sequence` is `u32::MAX` (no room to insert),
+    /// or if any existing point that would be renumbered is already at `u32::MAX`
+    /// (which would overflow its new sequence).
     fn insert_point(&mut self, shape_id: &str, after_sequence: u32,
                     lat: f64, lon: f64) -> bool {
-        let new_seq = after_sequence + 1;
+        // Guard: after_sequence + 1 must be representable.
+        let new_seq = match after_sequence.checked_add(1) {
+            Some(s) => s,
+            None    => return false, // after_sequence == u32::MAX
+        };
 
         let pts = self.shapes.entry(shape_id.to_string()).or_default();
 
@@ -204,9 +231,18 @@ impl ShapesEditorStore {
             .copied()
             .collect::<Vec<_>>();
 
+        // Guard: every key being renumbered must have room to increment.
+        // `to_bump` is ascending, so the last element is the highest.
+        if let Some(&max_seq) = to_bump.last() {
+            if max_seq == u32::MAX {
+                return false;
+            }
+        }
+
         // Move highest-sequence first to avoid key collisions during rename.
         for seq in to_bump.iter().rev() {
             if let Some(val) = pts.remove(seq) {
+                // Safe: we verified above that no element in to_bump is u32::MAX.
                 pts.insert(seq + 1, val);
             }
         }
@@ -274,6 +310,27 @@ fn points_to_ffi(points: Vec<EditorPoint>) -> (*mut FFIShapePoint, usize) {
     (ptr, count)
 }
 
+// ── FFI panic guard ───────────────────────────────────────────────────────────
+//
+// Panicking across an FFI boundary is Undefined Behavior.  Every `extern "C"`
+// entry point below uses this macro to catch any unexpected panic and return
+// a safe sentinel value instead of unwinding into the Swift/C caller.
+//
+// Usage:
+//   ffi_catch!(<default_on_panic>, { <body> })
+
+macro_rules! ffi_catch {
+    ($default:expr, $body:block) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(v)  => v,
+            Err(_) => {
+                eprintln!("shapes_editor: caught panic at FFI boundary");
+                $default
+            }
+        }
+    };
+}
+
 // ── FFI functions ─────────────────────────────────────────────────────────────
 
 /// Load and parse `path` (a null-terminated UTF-8 path to a shapes.txt file).
@@ -290,33 +347,39 @@ pub extern "C" fn shapes_editor_load(
         return std::ptr::null_mut();
     }
 
-    let path_str = match unsafe { CStr::from_ptr(path).to_str() } {
-        Ok(s)  => s,
-        Err(_) => { unsafe { *out_count = 0; } return std::ptr::null_mut(); }
-    };
+    ffi_catch!(std::ptr::null_mut(), {
+        let path_str = match unsafe { CStr::from_ptr(path).to_str() } {
+            Ok(s)  => s,
+            Err(_) => { unsafe { *out_count = 0; } return std::ptr::null_mut(); }
+        };
 
-    let csv = match std::fs::read_to_string(path_str) {
-        Ok(s)  => s,
-        Err(e) => {
-            eprintln!("shapes_editor_load: cannot read '{}': {}", path_str, e);
-            unsafe { *out_count = 0; }
-            return std::ptr::null_mut();
-        }
-    };
+        // Open with a BufReader so load() streams line-by-line.  This avoids
+        // the 2× peak-memory spike of read_to_string (raw bytes + BTreeMap
+        // both resident at once) on large national shapes.txt files.
+        let file = match std::fs::File::open(path_str) {
+            Ok(f)  => f,
+            Err(e) => {
+                eprintln!("shapes_editor_load: cannot open '{}': {}", path_str, e);
+                unsafe { *out_count = 0; }
+                return std::ptr::null_mut();
+            }
+        };
+        let reader = std::io::BufReader::new(file);
 
-    let mut ed = editor().lock().unwrap();
-    match ed.load(&csv) {
-        Ok(_) => {
-            let (ptr, count) = points_to_ffi(ed.all_points());
-            unsafe { *out_count = count; }
-            ptr
+        let mut ed = editor().lock().unwrap();
+        match ed.load(reader) {
+            Ok(_) => {
+                let (ptr, count) = points_to_ffi(ed.all_points());
+                unsafe { *out_count = count; }
+                ptr
+            }
+            Err(e) => {
+                eprintln!("shapes_editor_load: parse error: {}", e);
+                unsafe { *out_count = 0; }
+                std::ptr::null_mut()
+            }
         }
-        Err(e) => {
-            eprintln!("shapes_editor_load: parse error: {}", e);
-            unsafe { *out_count = 0; }
-            std::ptr::null_mut()
-        }
-    }
+    })
 }
 
 /// Serialize the current in-memory shapes to `path`.
@@ -325,19 +388,21 @@ pub extern "C" fn shapes_editor_load(
 pub extern "C" fn shapes_editor_save(path: *const c_char) -> i32 {
     if path.is_null() { return -1; }
 
-    let path_str = match unsafe { CStr::from_ptr(path).to_str() } {
-        Ok(s)  => s,
-        Err(_) => return -1,
-    };
+    ffi_catch!(-1, {
+        let path_str = match unsafe { CStr::from_ptr(path).to_str() } {
+            Ok(s)  => s,
+            Err(_) => return -1,
+        };
 
-    let ed  = editor().lock().unwrap();
-    let csv = ed.to_csv_bytes();
-    drop(ed); // release lock before I/O
+        let ed  = editor().lock().unwrap();
+        let csv = ed.to_csv_bytes();
+        drop(ed); // release lock before I/O
 
-    match std::fs::write(path_str, &csv) {
-        Ok(_)  => 0,
-        Err(e) => { eprintln!("shapes_editor_save: {}", e); -1 }
-    }
+        match std::fs::write(path_str, &csv) {
+            Ok(_)  => 0,
+            Err(e) => { eprintln!("shapes_editor_save: {}", e); -1 }
+        }
+    })
 }
 
 /// Return all current in-memory points as a flat array ordered by
@@ -347,19 +412,23 @@ pub extern "C" fn shapes_editor_save(path: *const c_char) -> i32 {
 pub extern "C" fn shapes_editor_get_all(out_count: *mut usize) -> *mut FFIShapePoint {
     if out_count.is_null() { return std::ptr::null_mut(); }
 
-    let ed  = editor().lock().unwrap();
-    let pts = ed.all_points();
-    drop(ed);
+    ffi_catch!(std::ptr::null_mut(), {
+        let ed  = editor().lock().unwrap();
+        let pts = ed.all_points();
+        drop(ed);
 
-    let (ptr, count) = points_to_ffi(pts);
-    unsafe { *out_count = count; }
-    ptr
+        let (ptr, count) = points_to_ffi(pts);
+        unsafe { *out_count = count; }
+        ptr
+    })
 }
 
 /// Return the total number of points currently in the editor store.
 #[no_mangle]
 pub extern "C" fn shapes_editor_point_count() -> usize {
-    editor().lock().unwrap().point_count()
+    ffi_catch!(0, {
+        editor().lock().unwrap().point_count()
+    })
 }
 
 /// Move an existing point to new coordinates.
@@ -374,12 +443,14 @@ pub extern "C" fn shapes_editor_update_point(
     new_lon:  f64,
 ) -> i32 {
     if shape_id.is_null() { return 0; }
-    let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
-        Ok(s)  => s,
-        Err(_) => return 0,
-    };
-    let mut ed = editor().lock().unwrap();
-    if ed.update_point(sid, sequence, new_lat, new_lon) { 1 } else { 0 }
+    ffi_catch!(0, {
+        let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
+            Ok(s)  => s,
+            Err(_) => return 0,
+        };
+        let mut ed = editor().lock().unwrap();
+        if ed.update_point(sid, sequence, new_lat, new_lon) { 1 } else { 0 }
+    })
 }
 
 /// Delete a single point identified by (shape_id, sequence).
@@ -391,12 +462,14 @@ pub extern "C" fn shapes_editor_delete_point(
     sequence: u32,
 ) -> i32 {
     if shape_id.is_null() { return 0; }
-    let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
-        Ok(s)  => s,
-        Err(_) => return 0,
-    };
-    let mut ed = editor().lock().unwrap();
-    if ed.delete_point(sid, sequence) { 1 } else { 0 }
+    ffi_catch!(0, {
+        let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
+            Ok(s)  => s,
+            Err(_) => return 0,
+        };
+        let mut ed = editor().lock().unwrap();
+        if ed.delete_point(sid, sequence) { 1 } else { 0 }
+    })
 }
 
 /// Insert a new point into `shape_id` immediately after `after_sequence`.
@@ -413,12 +486,14 @@ pub extern "C" fn shapes_editor_insert_point(
     lon:            f64,
 ) -> i32 {
     if shape_id.is_null() { return 0; }
-    let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
-        Ok(s)  => s,
-        Err(_) => return 0,
-    };
-    let mut ed = editor().lock().unwrap();
-    if ed.insert_point(sid, after_sequence, lat, lon) { 1 } else { 0 }
+    ffi_catch!(0, {
+        let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
+            Ok(s)  => s,
+            Err(_) => return 0,
+        };
+        let mut ed = editor().lock().unwrap();
+        if ed.insert_point(sid, after_sequence, lat, lon) { 1 } else { 0 }
+    })
 }
 
 /// Delete an entire shape (all points with the given shape_id).
@@ -426,12 +501,14 @@ pub extern "C" fn shapes_editor_insert_point(
 #[no_mangle]
 pub extern "C" fn shapes_editor_delete_shape(shape_id: *const c_char) -> i32 {
     if shape_id.is_null() { return 0; }
-    let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
-        Ok(s)  => s,
-        Err(_) => return 0,
-    };
-    let mut ed = editor().lock().unwrap();
-    if ed.delete_shape(sid) { 1 } else { 0 }
+    ffi_catch!(0, {
+        let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
+            Ok(s)  => s,
+            Err(_) => return 0,
+        };
+        let mut ed = editor().lock().unwrap();
+        if ed.delete_shape(sid) { 1 } else { 0 }
+    })
 }
 
 /// Register a new empty shape.
@@ -439,18 +516,22 @@ pub extern "C" fn shapes_editor_delete_shape(shape_id: *const c_char) -> i32 {
 #[no_mangle]
 pub extern "C" fn shapes_editor_add_shape(shape_id: *const c_char) -> i32 {
     if shape_id.is_null() { return 0; }
-    let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
-        Ok(s)  => s,
-        Err(_) => return 0,
-    };
-    let mut ed = editor().lock().unwrap();
-    if ed.add_shape(sid) { 1 } else { 0 }
+    ffi_catch!(0, {
+        let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
+            Ok(s)  => s,
+            Err(_) => return 0,
+        };
+        let mut ed = editor().lock().unwrap();
+        if ed.add_shape(sid) { 1 } else { 0 }
+    })
 }
 
 /// Clear all loaded data from the editor store.
 #[no_mangle]
 pub extern "C" fn shapes_editor_reset() {
-    editor().lock().unwrap().shapes.clear();
+    ffi_catch!((), {
+        editor().lock().unwrap().shapes.clear();
+    });
 }
 
 /// Free an `FFIShapePoint` array returned by any `shapes_editor_*` function.

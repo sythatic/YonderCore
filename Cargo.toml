@@ -1,9 +1,9 @@
 [package]
 name = "yonder_core"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 authors = ["Kirika.io"]
-description = "Yonder Maps data processing library"
+description = "A GTFS processing library"
 
 [lib]
 crate-type = ["staticlib"]  # Static library for iOS linking
