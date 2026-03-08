@@ -10,10 +10,12 @@ use rstar::{RTree, AABB, primitives::GeomWithData};
 mod tile_cache;
 mod gtfs_rt;
 mod gtfs_static;
+mod shapes_editor;
 
 pub use tile_cache::*;
 pub use gtfs_rt::*;
 pub use gtfs_static::*;
+pub use shapes_editor::*;
 
 // MARK: - Core Data Structures
 

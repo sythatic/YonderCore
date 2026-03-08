@@ -5,8 +5,6 @@ set -e
 cargo clean
 rm -f Cargo.lock
 
-sleep 15
-
 mkdir -p target/headers
 cp YonderCore.h target/headers/
 

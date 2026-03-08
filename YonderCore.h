@@ -259,4 +259,65 @@ InterpolatedPosition gtfs_interpolate_position(const char* trip_id, int64_t now_
 /// back to the raw GPS lat/lon from the GTFS-RT feed.
 int32_t gtfs_interpolation_is_ready(void);
 
+// MARK: - Shapes Editor
+
+/// One shape point as returned by the shapes editor FFI.
+/// shape_id is a heap-allocated C string; free the whole array with
+/// shapes_editor_free_points(ptr, count) — no other free is correct.
+typedef struct {
+    const char* shape_id;   ///< null-terminated shape identifier
+    uint32_t    sequence;   ///< shape_pt_sequence from shapes.txt
+    double      lat;        ///< shape_pt_lat
+    double      lon;        ///< shape_pt_lon
+} FFIShapePoint;
+
+/// Parse a shapes.txt file at `path` into the editor's in-memory store,
+/// replacing any previously loaded data.
+/// Returns a heap-allocated FFIShapePoint array (length *out_count), or NULL on error.
+/// Free with shapes_editor_free_points().
+FFIShapePoint* shapes_editor_load(const char* path, size_t* out_count);
+
+/// Serialise the current in-memory shapes back to `path` (overwrites the file).
+/// Returns 0 on success, -1 on error.
+int32_t shapes_editor_save(const char* path);
+
+/// Return all current in-memory points as a flat, (shape_id, sequence)-sorted array.
+/// Sets *out_count. Returns NULL if the store is empty.
+/// Free with shapes_editor_free_points().
+FFIShapePoint* shapes_editor_get_all(size_t* out_count);
+
+/// Return the total number of points currently held in the editor store.
+size_t shapes_editor_point_count(void);
+
+/// Move an existing point identified by (shape_id, sequence) to new coordinates.
+/// Returns 1 if found and updated, 0 if not found.
+int32_t shapes_editor_update_point(const char* shape_id, uint32_t sequence,
+                                    double new_lat, double new_lon);
+
+/// Delete the point at (shape_id, sequence).
+/// Automatically removes the parent shape entry when it becomes empty.
+/// Returns 1 if deleted, 0 if not found.
+int32_t shapes_editor_delete_point(const char* shape_id, uint32_t sequence);
+
+/// Insert a new point into shape_id immediately after after_sequence.
+/// All points in the shape with sequence >= (after_sequence + 1) are renumbered +1.
+/// Returns 1 on success, 0 on invalid arguments.
+int32_t shapes_editor_insert_point(const char* shape_id, uint32_t after_sequence,
+                                    double lat, double lon);
+
+/// Delete an entire shape and all its points.
+/// Returns 1 if the shape existed and was deleted, 0 if not found.
+int32_t shapes_editor_delete_shape(const char* shape_id);
+
+/// Register a new empty shape so it appears in the editor immediately.
+/// Returns 1 if created, 0 if a shape with that ID already exists.
+int32_t shapes_editor_add_shape(const char* shape_id);
+
+/// Clear all data from the editor store (does not affect the GTFS pipeline).
+void shapes_editor_reset(void);
+
+/// Free an FFIShapePoint array returned by any shapes_editor_* function.
+void shapes_editor_free_points(FFIShapePoint* ptr, size_t count);
+
+
 #endif /* YonderCore_h */
