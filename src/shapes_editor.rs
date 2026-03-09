@@ -335,48 +335,44 @@ macro_rules! ffi_catch {
 
 /// Load and parse `path` (a null-terminated UTF-8 path to a shapes.txt file).
 ///
-/// Replaces any previously loaded data.  Returns a heap-allocated array of
-/// `FFIShapePoint` with `*out_count` elements, or NULL on error.
-/// The caller must free the result with `shapes_editor_free_points`.
+/// Replaces any previously loaded data.  Returns the total number of points
+/// loaded, or 0 on error.  Use `shapes_editor_get_shape` to fetch per-shape
+/// point data lazily after inspecting the shape list via `shapes_editor_get_shape_ids`.
 #[no_mangle]
 pub extern "C" fn shapes_editor_load(
     path:      *const c_char,
     out_count: *mut usize,
-) -> *mut FFIShapePoint {
+) -> i32 {
     if path.is_null() || out_count.is_null() {
-        return std::ptr::null_mut();
+        return -1;
     }
 
-    ffi_catch!(std::ptr::null_mut(), {
+    ffi_catch!(-1, {
         let path_str = match unsafe { CStr::from_ptr(path).to_str() } {
             Ok(s)  => s,
-            Err(_) => { unsafe { *out_count = 0; } return std::ptr::null_mut(); }
+            Err(_) => { unsafe { *out_count = 0; } return -1; }
         };
 
-        // Open with a BufReader so load() streams line-by-line.  This avoids
-        // the 2× peak-memory spike of read_to_string (raw bytes + BTreeMap
-        // both resident at once) on large national shapes.txt files.
         let file = match std::fs::File::open(path_str) {
             Ok(f)  => f,
             Err(e) => {
                 eprintln!("shapes_editor_load: cannot open '{}': {}", path_str, e);
                 unsafe { *out_count = 0; }
-                return std::ptr::null_mut();
+                return -1;
             }
         };
         let reader = std::io::BufReader::new(file);
 
         let mut ed = editor().lock().unwrap();
         match ed.load(reader) {
-            Ok(_) => {
-                let (ptr, count) = points_to_ffi(ed.all_points());
-                unsafe { *out_count = count; }
-                ptr
+            Ok(total) => {
+                unsafe { *out_count = total; }
+                0
             }
             Err(e) => {
                 eprintln!("shapes_editor_load: parse error: {}", e);
                 unsafe { *out_count = 0; }
-                std::ptr::null_mut()
+                -1
             }
         }
     })
@@ -402,6 +398,77 @@ pub extern "C" fn shapes_editor_save(path: *const c_char) -> i32 {
             Ok(_)  => 0,
             Err(e) => { eprintln!("shapes_editor_save: {}", e); -1 }
         }
+    })
+}
+
+/// Return a newline-delimited list of "shape_id,count" pairs for every shape
+/// currently in the store, as a single heap-allocated C string.
+///
+/// The caller must free the result with `shapes_editor_free_string`.
+/// Returns NULL on error or if the store is empty.
+#[no_mangle]
+pub extern "C" fn shapes_editor_get_shape_ids() -> *mut c_char {
+    ffi_catch!(std::ptr::null_mut(), {
+        let ed = editor().lock().unwrap();
+        if ed.shapes.is_empty() { return std::ptr::null_mut(); }
+
+        let mut out = String::new();
+        for (shape_id, pts) in &ed.shapes {
+            out.push_str(shape_id);
+            out.push(',');
+            out.push_str(&pts.len().to_string());
+            out.push('\n');
+        }
+        drop(ed);
+
+        match CString::new(out) {
+            Ok(s)  => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Free a C string returned by `shapes_editor_get_shape_ids`.
+#[no_mangle]
+pub extern "C" fn shapes_editor_free_string(ptr: *mut c_char) {
+    if ptr.is_null() { return; }
+    unsafe { let _ = CString::from_raw(ptr); }
+}
+
+/// Return all points for a single shape as a heap-allocated FFIShapePoint array.
+/// Sets `*out_count`; returns NULL if the shape does not exist or is empty.
+/// Free with `shapes_editor_free_points`.
+#[no_mangle]
+pub extern "C" fn shapes_editor_get_shape(
+    shape_id:  *const c_char,
+    out_count: *mut usize,
+) -> *mut FFIShapePoint {
+    if shape_id.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+    ffi_catch!(std::ptr::null_mut(), {
+        let sid = match unsafe { CStr::from_ptr(shape_id).to_str() } {
+            Ok(s)  => s,
+            Err(_) => { unsafe { *out_count = 0; } return std::ptr::null_mut(); }
+        };
+
+        let ed = editor().lock().unwrap();
+        let pts = match ed.shapes.get(sid) {
+            Some(m) => m.iter()
+                .map(|(&seq, &(lat, lon))| EditorPoint {
+                    shape_id: sid.to_string(),
+                    sequence: seq,
+                    lat,
+                    lon,
+                })
+                .collect::<Vec<_>>(),
+            None => { unsafe { *out_count = 0; } return std::ptr::null_mut(); }
+        };
+        drop(ed);
+
+        let (ptr, count) = points_to_ffi(pts);
+        unsafe { *out_count = count; }
+        ptr
     })
 }
 

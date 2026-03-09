@@ -273,9 +273,9 @@ typedef struct {
 
 /// Parse a shapes.txt file at `path` into the editor's in-memory store,
 /// replacing any previously loaded data.
-/// Returns a heap-allocated FFIShapePoint array (length *out_count), or NULL on error.
-/// Free with shapes_editor_free_points().
-FFIShapePoint* shapes_editor_load(const char* path, size_t* out_count);
+/// Returns 0 on success, -1 on error. *out_count is set to the total point count.
+/// Use shapes_editor_get_shape_ids() and shapes_editor_get_shape() to fetch data lazily.
+int32_t shapes_editor_load(const char* path, size_t* out_count);
 
 /// Serialise the current in-memory shapes back to `path` (overwrites the file).
 /// Returns 0 on success, -1 on error.
@@ -285,6 +285,19 @@ int32_t shapes_editor_save(const char* path);
 /// Sets *out_count. Returns NULL if the store is empty.
 /// Free with shapes_editor_free_points().
 FFIShapePoint* shapes_editor_get_all(size_t* out_count);
+
+/// Return a newline-delimited "shape_id,count\n..." C string listing every shape
+/// and its point count. Free with shapes_editor_free_string().
+/// Returns NULL if the store is empty.
+char* shapes_editor_get_shape_ids(void);
+
+/// Free a C string returned by shapes_editor_get_shape_ids().
+void shapes_editor_free_string(char* ptr);
+
+/// Return all points for a single shape as a heap-allocated FFIShapePoint array.
+/// Sets *out_count. Returns NULL if the shape does not exist.
+/// Free with shapes_editor_free_points().
+FFIShapePoint* shapes_editor_get_shape(const char* shape_id, size_t* out_count);
 
 /// Return the total number of points currently held in the editor store.
 size_t shapes_editor_point_count(void);
