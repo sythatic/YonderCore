@@ -400,11 +400,6 @@ fn query_position(timeline: &TripShapeTimeline, secs: i64) -> Option<(f64, f64)>
     // .unwrap_or_else replaces the equivalent match { Ok(i) => i, Err(i) => i.saturating_sub(1) }:
     //   Ok(exact)  — `secs` coincides exactly with a known shape-point time → use that index
     //   Err(next)  — `secs` falls between two points → step back one to get the left endpoint
-    //
-    // Safety note: Err(0).saturating_sub(1) == 0, which would silently snap
-    // the position to the first point. This case is unreachable here because
-    // `secs < times[0]` is caught by the early-return guard above. The guards
-    // must be kept in sync with this arithmetic if this function is ever refactored.
     let seg = times
         .binary_search(&secs)
         .unwrap_or_else(|next| next.saturating_sub(1));
@@ -483,15 +478,6 @@ fn parse_eocd(data: &[u8]) -> Result<Vec<(String, u64, u64)>, String> {
 
     let cd_size   = u32::from_le_bytes(eocd[12..16].try_into().unwrap()) as u64;
     let cd_offset = u32::from_le_bytes(eocd[16..20].try_into().unwrap()) as u64;
-
-    // ZIP64 archives encode these fields as 0xFFFFFFFF and store the real
-    // values in a ZIP64 End-of-Central-Directory record. We don't support
-    // ZIP64, but Amtrak's feed is well under 4 GB so this should never fire.
-    // Guard explicitly so a future feed restructure fails with a clear error
-    // rather than silently misparsing with garbage offsets.
-    if cd_size == 0xFFFF_FFFF || cd_offset == 0xFFFF_FFFF {
-        return Err("ZIP64 format is not supported".into());
-    }
 
     let tail_start_in_file = {
         let eocd_in_file = cd_offset + cd_size;
@@ -968,10 +954,6 @@ pub extern "C" fn gtfs_static_feed_eocd(
                 })
                 .collect();
 
-            // shrink_to_fit ensures len == capacity before we forget the Vec.
-            // gtfs_static_free_ranges reconstructs it as Vec::from_raw_parts(ptr, count, count),
-            // which is only safe when capacity == len — otherwise drop deallocates the wrong size.
-            out.shrink_to_fit();
             let count = out.len();
             unsafe { *out_count = count };
             let ptr = out.as_mut_ptr();
@@ -1216,22 +1198,6 @@ pub extern "C" fn gtfs_static_is_trip_active(
     if s.is_trip_active(tid, now_eastern) { 1 } else { 0 }
 }
 
-/// Crate-internal equivalent of `gtfs_static_is_loaded` — avoids the C FFI
-/// overhead when called from within the same crate (e.g. from gtfs_rt.rs).
-pub(crate) fn is_loaded_internal() -> bool {
-    let s = store().lock().unwrap();
-    !s.route_names.is_empty() && !s.trips.is_empty() && !s.trip_windows.is_empty()
-}
-
-/// Crate-internal equivalent of `gtfs_static_is_trip_active`.
-/// Returns `true` (pass-through) when trip_windows haven't loaded yet,
-/// matching the behavior of the C FFI version.
-pub(crate) fn is_trip_active_internal(trip_id: &str, now_eastern: i64) -> bool {
-    let s = store().lock().unwrap();
-    if s.trip_windows.is_empty() { return true; }
-    s.is_trip_active(trip_id, now_eastern)
-}
-
 /// Compute a smooth interpolated position for `trip_id` at `now_eastern`.
 ///
 /// `now_eastern` is `now_unix + TimeZone("America/New_York").secondsFromGMT(now)`.
@@ -1278,14 +1244,16 @@ pub extern "C" fn gtfs_interpolation_is_ready() -> i32 {
 }
 
 /// Evict all loaded data (e.g. before a refresh).
-///
-/// Replaces the entire store rather than calling `.clear()` on each map.
-/// `HashMap::clear()` retains allocated bucket capacity, so after parsing a
-/// large feed (Amtrak stop_times.txt is ~1 M rows) a subsequent reset would
-/// keep all that heap memory live for the lifetime of the singleton. Replacing
-/// the store drops every HashMap and returns the memory to the allocator.
 #[no_mangle]
 pub extern "C" fn gtfs_static_reset() {
     let mut s = store().lock().unwrap();
-    *s = GtfsStaticStore::new();
+    s.route_names.clear();
+    s.trips.clear();
+    s.trip_windows.clear();
+    s.cd_entries.clear();
+    s.shape_points.clear();
+    s.stop_latlon.clear();
+    s.trip_shape_ids.clear();
+    s.trip_stop_seqs.clear();
+    s.shape_timelines.clear();
 }

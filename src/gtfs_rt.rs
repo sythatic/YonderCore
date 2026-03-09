@@ -1,6 +1,5 @@
 use prost::Message;
 use std::ffi::{CStr, CString, c_char};
-use crate::gtfs_static;
 
 // MARK: - Protobuf Message Definitions
 // Matches the official GTFS-RT spec:
@@ -84,19 +83,10 @@ pub struct StopTimeUpdate {
 }
 
 /// Per-stop schedule relationship values for StopTimeUpdate (field 5).
-///
-/// These are the *stop-level* values (StopTimeUpdate.schedule_relationship),
-/// which are a separate enum from the *trip-level* `ScheduleRelationship`
-/// (TripDescriptor.schedule_relationship). The numeric values overlap but the
-/// semantics differ — do not mix them up.
-///
-/// If stop-level values 4–8 (UNSCHEDULED=3 already present, plus any future
-/// additions per the spec) are needed, add them here AND verify they don't
-/// conflict with the trip-level `ScheduleRelationship` enum above.
 pub mod stop_time_schedule_relationship {
-    pub const SCHEDULED:   i32 = 0;
-    pub const SKIPPED:     i32 = 1;
-    pub const NO_DATA:     i32 = 2;
+    pub const SCHEDULED: i32 = 0;
+    pub const SKIPPED: i32 = 1;
+    pub const NO_DATA: i32 = 2;
     pub const UNSCHEDULED: i32 = 3;
 }
 
@@ -477,15 +467,16 @@ impl GtfsRtManager {
     /// Returns `(delay_seconds, has_delay, next_stop_id_ptr, next_arrival_time, has_next_stop)`.
     /// The returned `next_stop_id` pointer is a CString allocated via `into_raw()`; the
     /// caller must free it with `CString::from_raw` when it is no longer needed.
-    ///
-    /// `now` should be pre-computed by the caller (Unix seconds) so that large
-    /// vehicle batches don't each issue their own `SystemTime::now()` syscall.
     pub(crate) fn get_trip_update_inner(
         &self,
         trip_id: &str,
-        now: i64,
     ) -> Option<(i32, bool, *const c_char, i64, bool)> {
         let tu = self.find_trip_update(trip_id)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         let mut delay_seconds: Option<i32> = tu.delay;
 
@@ -773,31 +764,24 @@ impl GtfsRtCore {
     /// Return all vehicles from the RT VehiclePositions feed, enriched with
     /// TripUpdate (delay / next-stop) data where available.
     ///
-    /// `now_eastern` = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
-    ///
-    /// When static data is fully loaded, vehicles whose trip falls outside the
-    /// schedule window (pre-departure or post-arrival) are excluded. This prevents
-    /// parked trains from appearing clumped at terminal stations (WAS/PHL/NYP/etc.)
-    /// with valid GPS coordinates. While static data is still loading, the gate
-    /// passes every vehicle through so nothing disappears during startup.
+    /// `now_eastern` is retained in the signature for API compatibility but is
+    /// no longer used to gate vehicles.  Every vehicle present in the RT feed
+    /// is included — the RT feed is the authoritative source of truth for what
+    /// is currently moving.  Static schedule windows are intentionally NOT used
+    /// here because they cause live trains to disappear due to timezone edge
+    /// cases, unusual service days, and trip_id prefix mismatches between the
+    /// RT and static feeds.
     ///
     /// Vehicles with (lat == 0, lon == 0) are passed through with those
     /// coordinates intact; Swift should detect this sentinel and fall back to
     /// gtfs_interpolate_position or hide the icon.
-    pub fn get_active_enriched_vehicles(&self, now_eastern: i64) -> Result<Vec<FFIEnrichedVehicle>, String> {
+    pub fn get_active_enriched_vehicles(&self, _now_eastern: i64) -> Result<Vec<FFIEnrichedVehicle>, String> {
         let mgr = self
             .manager
             .lock()
             .map_err(|_| "Failed to acquire lock".to_string())?;
 
         let header_ts = mgr.last_update.unwrap_or(0);
-
-        // Compute once and reuse across all vehicles — avoids N syscalls for
-        // feeds with hundreds of active vehicles.
-        let now: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
 
         let mut result = Vec::with_capacity(mgr.vehicles.len());
 
@@ -808,15 +792,14 @@ impl GtfsRtCore {
                 None => continue,
             };
 
-            // Step 2 — extract trip_id, then apply schedule-window gate.
-            //
-            // Only gate when static data is fully loaded. While trip_windows are
-            // still empty, is_trip_active_internal returns true for every trip, so
-            // no vehicles are incorrectly hidden during startup.
-            //
-            // Once loaded, pre-departure and post-arrival trains are excluded.
-            // Without this gate those trains are physically at the station with
-            // real GPS coordinates (lat/lon ≠ 0) and pile up visibly at WAS/PHL/NYP.
+            // Step 2 — extract trip_id for TripUpdate enrichment.
+            // Note: we intentionally do NOT call gtfs_static_is_trip_active here.
+            // If a vehicle is present in the RT VehiclePositions feed it is by
+            // definition active. Suppressing it based on static schedule windows
+            // causes live trains to disappear due to timezone edge cases, unusual
+            // service days, or trip_id prefix mismatches between the RT and static
+            // feeds.  The static gate belongs only in search/timetable UIs that
+            // need to show scheduled-but-not-yet-departed trains, not on the map.
             let trip_id_cstr: Option<&CStr> = if ffi.trip_id.is_null() {
                 None
             } else {
@@ -824,29 +807,11 @@ impl GtfsRtCore {
                 Some(unsafe { CStr::from_ptr(ffi.trip_id) })
             };
 
-            if gtfs_static::is_loaded_internal() {
-                if let Some(tid_cstr) = trip_id_cstr {
-                    if !gtfs_static::is_trip_active_internal(
-                        tid_cstr.to_str().unwrap_or(""),
-                        now_eastern,
-                    ) {
-                        // Free CStrings allocated by vehicle_to_ffi before skipping.
-                        unsafe {
-                            if !ffi.id.is_null()       { drop(CString::from_raw(ffi.id       as *mut c_char)); }
-                            if !ffi.route_id.is_null() { drop(CString::from_raw(ffi.route_id as *mut c_char)); }
-                            if !ffi.trip_id.is_null()  { drop(CString::from_raw(ffi.trip_id  as *mut c_char)); }
-                            if !ffi.label.is_null()    { drop(CString::from_raw(ffi.label    as *mut c_char)); }
-                        }
-                        continue;
-                    }
-                }
-            }
-
             // Step 3 — enrich with TripUpdate data (reuse the existing logic).
             let (delay_seconds, has_delay, next_stop_id, next_arrival_time, has_next_stop) =
                 if let Some(tid) = trip_id_cstr {
                     let tid_str = tid.to_str().unwrap_or("");
-                    mgr.get_trip_update_inner(tid_str, now)
+                    mgr.get_trip_update_inner(tid_str)
                         .unwrap_or((0, false, std::ptr::null(), 0, false))
                 } else {
                     (0, false, std::ptr::null(), 0, false)
@@ -873,12 +838,6 @@ impl GtfsRtCore {
             });
         }
 
-        // Ensure len == capacity before callers leak this Vec across FFI.
-        // Vec::with_capacity(mgr.vehicles.len()) may over-allocate when vehicles
-        // are filtered out; Vec::from_raw_parts in the free function requires the
-        // capacity passed in to exactly match what was originally allocated.
-        result.shrink_to_fit();
-
         Ok(result)
     }
 
@@ -901,13 +860,8 @@ impl GtfsRtCore {
             .lock()
             .map_err(|_| "Failed to acquire lock".to_string())?;
 
-        let now: i64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
         let Some((delay_seconds, has_delay, next_stop_id, next_arrival_time, has_next_stop)) =
-            mgr.get_trip_update_inner(trip_id, now)
+            mgr.get_trip_update_inner(trip_id)
         else {
             return Ok(None);
         };
@@ -967,69 +921,4 @@ pub struct TripUpdateSummary {
     pub next_arrival_time: i64,
     /// True if `next_stop_id` and `next_arrival_time` are populated.
     pub has_next_stop: bool,
-}
-
-// MARK: - FFI Deallocation
-
-/// Free the array returned by `gtfs_rt_get_active_enriched_vehicles`.
-///
-/// # Safety
-/// - `ptr` must be the exact pointer returned by `gtfs_rt_get_active_enriched_vehicles`,
-///   or null.
-/// - `count` must be the exact `out_count` value written by that function.
-/// - Must be called exactly once per allocation; double-freeing is UB.
-/// - `ptr` must not be used after this call.
-///
-/// Each string field (`id`, `route_id`, `trip_id`, `label`, `next_stop_id`)
-/// was allocated as a `CString` via `into_raw()`; this function reclaims all of
-/// them before dropping the backing array.
-#[no_mangle]
-pub unsafe extern "C" fn gtfs_rt_free_enriched_vehicles(
-    ptr: *mut FFIEnrichedVehicle,
-    count: usize,
-) {
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: ptr was produced by Vec::as_mut_ptr() after shrink_to_fit(), so
-    // len == capacity == count.  Reconstructing the Vec hands ownership back to
-    // Rust and ensures the backing allocation is freed when the Vec is dropped.
-    let vehicles = Vec::from_raw_parts(ptr, count, count);
-    for v in vehicles {
-        // Each non-null *const c_char was produced by CString::into_raw().
-        // Casting back to *mut c_char and passing to CString::from_raw()
-        // reconstructs the original CString so Rust can free it correctly.
-        if !v.id.is_null() {
-            drop(CString::from_raw(v.id as *mut c_char));
-        }
-        if !v.route_id.is_null() {
-            drop(CString::from_raw(v.route_id as *mut c_char));
-        }
-        if !v.trip_id.is_null() {
-            drop(CString::from_raw(v.trip_id as *mut c_char));
-        }
-        if !v.label.is_null() {
-            drop(CString::from_raw(v.label as *mut c_char));
-        }
-        if !v.next_stop_id.is_null() {
-            drop(CString::from_raw(v.next_stop_id as *mut c_char));
-        }
-    }
-    // Vec backing storage freed here when `vehicles` goes out of scope.
-}
-
-/// Free the `next_stop_id` string inside a `TripUpdateSummary` returned by
-/// `gtfs_rt_get_trip_update`.
-///
-/// Call this once per `TripUpdateSummary` that has `has_next_stop == true`.
-/// It is safe to call even when `next_stop_id` is null (no-op).
-///
-/// # Safety
-/// - `summary` must have been returned by `gtfs_rt_get_trip_update`.
-/// - Must be called exactly once; double-freeing is UB.
-#[no_mangle]
-pub unsafe extern "C" fn gtfs_rt_free_trip_update_summary(summary: TripUpdateSummary) {
-    if !summary.next_stop_id.is_null() {
-        drop(CString::from_raw(summary.next_stop_id as *mut c_char));
-    }
 }
