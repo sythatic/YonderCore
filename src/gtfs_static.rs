@@ -1216,6 +1216,22 @@ pub extern "C" fn gtfs_static_is_trip_active(
     if s.is_trip_active(tid, now_eastern) { 1 } else { 0 }
 }
 
+/// Crate-internal equivalent of `gtfs_static_is_loaded` — avoids the C FFI
+/// overhead when called from within the same crate (e.g. from gtfs_rt.rs).
+pub(crate) fn is_loaded_internal() -> bool {
+    let s = store().lock().unwrap();
+    !s.route_names.is_empty() && !s.trips.is_empty() && !s.trip_windows.is_empty()
+}
+
+/// Crate-internal equivalent of `gtfs_static_is_trip_active`.
+/// Returns `true` (pass-through) when trip_windows haven't loaded yet,
+/// matching the behavior of the C FFI version.
+pub(crate) fn is_trip_active_internal(trip_id: &str, now_eastern: i64) -> bool {
+    let s = store().lock().unwrap();
+    if s.trip_windows.is_empty() { return true; }
+    s.is_trip_active(trip_id, now_eastern)
+}
+
 /// Compute a smooth interpolated position for `trip_id` at `now_eastern`.
 ///
 /// `now_eastern` is `now_unix + TimeZone("America/New_York").secondsFromGMT(now)`.

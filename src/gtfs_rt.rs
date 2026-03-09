@@ -1,5 +1,6 @@
 use prost::Message;
 use std::ffi::{CStr, CString, c_char};
+use crate::gtfs_static;
 
 // MARK: - Protobuf Message Definitions
 // Matches the official GTFS-RT spec:
@@ -772,18 +773,18 @@ impl GtfsRtCore {
     /// Return all vehicles from the RT VehiclePositions feed, enriched with
     /// TripUpdate (delay / next-stop) data where available.
     ///
-    /// `now_eastern` is retained in the signature for API compatibility but is
-    /// no longer used to gate vehicles.  Every vehicle present in the RT feed
-    /// is included — the RT feed is the authoritative source of truth for what
-    /// is currently moving.  Static schedule windows are intentionally NOT used
-    /// here because they cause live trains to disappear due to timezone edge
-    /// cases, unusual service days, and trip_id prefix mismatches between the
-    /// RT and static feeds.
+    /// `now_eastern` = now_unix + TimeZone("America/New_York").secondsFromGMT(now)
+    ///
+    /// When static data is fully loaded, vehicles whose trip falls outside the
+    /// schedule window (pre-departure or post-arrival) are excluded. This prevents
+    /// parked trains from appearing clumped at terminal stations (WAS/PHL/NYP/etc.)
+    /// with valid GPS coordinates. While static data is still loading, the gate
+    /// passes every vehicle through so nothing disappears during startup.
     ///
     /// Vehicles with (lat == 0, lon == 0) are passed through with those
     /// coordinates intact; Swift should detect this sentinel and fall back to
     /// gtfs_interpolate_position or hide the icon.
-    pub fn get_active_enriched_vehicles(&self, _now_eastern: i64) -> Result<Vec<FFIEnrichedVehicle>, String> {
+    pub fn get_active_enriched_vehicles(&self, now_eastern: i64) -> Result<Vec<FFIEnrichedVehicle>, String> {
         let mgr = self
             .manager
             .lock()
@@ -807,20 +808,39 @@ impl GtfsRtCore {
                 None => continue,
             };
 
-            // Step 2 — extract trip_id for TripUpdate enrichment.
-            // Note: we intentionally do NOT call gtfs_static_is_trip_active here.
-            // If a vehicle is present in the RT VehiclePositions feed it is by
-            // definition active. Suppressing it based on static schedule windows
-            // causes live trains to disappear due to timezone edge cases, unusual
-            // service days, or trip_id prefix mismatches between the RT and static
-            // feeds.  The static gate belongs only in search/timetable UIs that
-            // need to show scheduled-but-not-yet-departed trains, not on the map.
+            // Step 2 — extract trip_id, then apply schedule-window gate.
+            //
+            // Only gate when static data is fully loaded. While trip_windows are
+            // still empty, is_trip_active_internal returns true for every trip, so
+            // no vehicles are incorrectly hidden during startup.
+            //
+            // Once loaded, pre-departure and post-arrival trains are excluded.
+            // Without this gate those trains are physically at the station with
+            // real GPS coordinates (lat/lon ≠ 0) and pile up visibly at WAS/PHL/NYP.
             let trip_id_cstr: Option<&CStr> = if ffi.trip_id.is_null() {
                 None
             } else {
                 // SAFETY: pointer was just produced by CString::into_raw() in vehicle_to_ffi.
                 Some(unsafe { CStr::from_ptr(ffi.trip_id) })
             };
+
+            if gtfs_static::is_loaded_internal() {
+                if let Some(tid_cstr) = trip_id_cstr {
+                    if !gtfs_static::is_trip_active_internal(
+                        tid_cstr.to_str().unwrap_or(""),
+                        now_eastern,
+                    ) {
+                        // Free CStrings allocated by vehicle_to_ffi before skipping.
+                        unsafe {
+                            if !ffi.id.is_null()       { drop(CString::from_raw(ffi.id       as *mut c_char)); }
+                            if !ffi.route_id.is_null() { drop(CString::from_raw(ffi.route_id as *mut c_char)); }
+                            if !ffi.trip_id.is_null()  { drop(CString::from_raw(ffi.trip_id  as *mut c_char)); }
+                            if !ffi.label.is_null()    { drop(CString::from_raw(ffi.label    as *mut c_char)); }
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // Step 3 — enrich with TripUpdate data (reuse the existing logic).
             let (delay_seconds, has_delay, next_stop_id, next_arrival_time, has_next_stop) =
