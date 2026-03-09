@@ -11,11 +11,7 @@
     </cargoProject>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="e84105bb-9ae5-4d47-a538-28d597ce00e0" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/YonderCore.h" beforeDir="false" afterPath="$PROJECT_DIR$/YonderCore.h" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/shapes_editor.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/shapes_editor.rs" afterDir="false" />
-    </list>
+    <list default="true" id="e84105bb-9ae5-4d47-a538-28d597ce00e0" name="Changes" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -123,6 +119,7 @@
       <workItem from="1772695585859" duration="1432000" />
       <workItem from="1772930144777" duration="2832000" />
       <workItem from="1772991175868" duration="4523000" />
+      <workItem from="1773051969534" duration="704000" />
     </task>
     <servers />
   </component>
