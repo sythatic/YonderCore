@@ -72,9 +72,10 @@ impl ShapesEditorStore {
     /// peak RSS: the raw file bytes are never resident alongside the BTreeMap.
     ///
     /// # CSV compliance note
-    /// Uses a fast `splitn(5, ',')` parser.  GTFS shape IDs are machine-generated
-    /// identifiers (e.g. `2553_0`, `NEC_NB`) and no real feed uses quoted commas
-    /// in this field, so full RFC-4180 quoting is deliberately not implemented.
+    /// Resolves column order from the header row when present, so feeds that
+    /// include `shape_dist_traveled` or use a non-canonical column order (e.g.
+    /// SunRail) are parsed correctly.  Falls back to standard GTFS order
+    /// (shape_id=0, lat=1, lon=2, seq=3) when no header is detected.
     fn load<R: std::io::BufRead>(&mut self, reader: R) -> Result<usize, String> {
         let mut new_shapes: BTreeMap<String, BTreeMap<u32, (f64, f64)>> = BTreeMap::new();
         let mut total      = 0usize;
@@ -82,6 +83,12 @@ impl ShapesEditorStore {
         let mut buf        = String::new();
         let mut saw_header = false;
         let mut reader     = reader;
+
+        // Column indices — default to canonical GTFS order, overridden by header.
+        let mut col_id  = 0usize;
+        let mut col_lat = 1usize;
+        let mut col_lon = 2usize;
+        let mut col_seq = 3usize;
 
         loop {
             buf.clear();
@@ -93,36 +100,39 @@ impl ShapesEditorStore {
             let line = buf.trim();
             if line.is_empty() { continue; }
 
-            // Detect and skip exactly the first header row.
+            // First non-empty line: detect header and resolve column positions.
             if !saw_header {
-                let low = line.to_ascii_lowercase();
                 saw_header = true;
+                let low = line.to_ascii_lowercase();
                 if low.contains("shape_id") || low.contains("shape_pt_lat") {
-                    continue; // skip header, proceed to next line
+                    for (i, h) in line.split(',').map(|h| h.trim()).enumerate() {
+                        match h.to_ascii_lowercase().as_str() {
+                            "shape_id"          => col_id  = i,
+                            "shape_pt_lat"      => col_lat = i,
+                            "shape_pt_lon"      => col_lon = i,
+                            "shape_pt_sequence" => col_seq = i,
+                            _ => {}
+                        }
+                    }
+                    continue; // header consumed, move to data rows
                 }
-                // No header — fall through and parse this line as data.
+                // No header row — fall through and parse this line as data
+                // using the default column indices already set above.
             }
 
-            // Fast split — GTFS shapes.txt has exactly 4 columns:
-            //   shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence
-            // (optional shape_dist_traveled at index 4 is silently ignored)
-            let mut cols = line.splitn(5, ',');
-            let shape_id = match cols.next() {
-                Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_id", line_no)),
-            };
-            let lat_str = match cols.next() {
-                Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_pt_lat", line_no)),
-            };
-            let lon_str = match cols.next() {
-                Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_pt_lon", line_no)),
-            };
-            let seq_str = match cols.next() {
-                Some(s) => s.trim(),
-                None    => return Err(format!("line {}: missing shape_pt_sequence", line_no)),
-            };
+            // Collect all columns so any column count works
+            // (handles shape_dist_traveled and other optional columns).
+            let cols: Vec<&str> = line.split(',').collect();
+            let max_idx = col_id.max(col_lat).max(col_lon).max(col_seq);
+            if cols.len() <= max_idx {
+                return Err(format!("line {}: only {} columns, need index {}",
+                                   line_no, cols.len(), max_idx));
+            }
+
+            let shape_id = cols[col_id].trim();
+            let lat_str  = cols[col_lat].trim();
+            let lon_str  = cols[col_lon].trim();
+            let seq_str  = cols[col_seq].trim();
 
             let lat: f64 = lat_str.parse()
                 .map_err(|_| format!("line {}: invalid lat '{}'", line_no, lat_str))?;
