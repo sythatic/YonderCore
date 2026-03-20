@@ -260,10 +260,6 @@ InterpolatedPosition gtfs_interpolate_position(const char* trip_id, int64_t now_
 int32_t gtfs_interpolation_is_ready(void);
 
 // MARK: - Shapes Editor
-//
-// Each open file gets its own independent store identified by a uint32_t
-// store_id.  Stores are never merged; all mutation and query functions require
-// a store_id as their first argument.
 
 /// One shape point as returned by the shapes editor FFI.
 /// shape_id is a heap-allocated C string; free the whole array with
@@ -275,75 +271,63 @@ typedef struct {
     double      lon;        ///< shape_pt_lon
 } FFIShapePoint;
 
-/// Allocate a new independent editor store.
-/// Returns a non-zero store_id on success, or 0 on failure.
-/// Release with shapes_editor_close() when the file is closed.
-uint32_t shapes_editor_open(void);
-
-/// Release the store identified by store_id and free all its memory.
-/// Passing an unknown ID is a no-op.
-void shapes_editor_close(uint32_t store_id);
-
-/// Parse a shapes.txt file at `path` into store_id, replacing any
-/// previously loaded data in that store.
+/// Parse a shapes.txt file at `path` into the editor's in-memory store,
+/// replacing any previously loaded data.
 /// Returns 0 on success, -1 on error. *out_count is set to the total point count.
 /// Use shapes_editor_get_shape_ids() and shapes_editor_get_shape() to fetch data lazily.
-int32_t shapes_editor_load(uint32_t store_id, const char* path, size_t* out_count);
+int32_t shapes_editor_load(const char* path, size_t* out_count);
 
-/// Serialise the store identified by store_id back to `path` (overwrites the file).
+/// Serialise the current in-memory shapes back to `path` (overwrites the file).
 /// Returns 0 on success, -1 on error.
-int32_t shapes_editor_save(uint32_t store_id, const char* path);
+int32_t shapes_editor_save(const char* path);
 
-/// Return all current points in store_id as a flat, (shape_id, sequence)-sorted array.
-/// Sets *out_count. Returns NULL if the store is empty or unknown.
+/// Return all current in-memory points as a flat, (shape_id, sequence)-sorted array.
+/// Sets *out_count. Returns NULL if the store is empty.
 /// Free with shapes_editor_free_points().
-FFIShapePoint* shapes_editor_get_all(uint32_t store_id, size_t* out_count);
+FFIShapePoint* shapes_editor_get_all(size_t* out_count);
 
-/// Return a newline-delimited "shape_id,count\n..." C string for store_id.
-/// Free with shapes_editor_free_string().
-/// Returns NULL if the store is empty or unknown.
-char* shapes_editor_get_shape_ids(uint32_t store_id);
+/// Return a newline-delimited "shape_id,count\n..." C string listing every shape
+/// and its point count. Free with shapes_editor_free_string().
+/// Returns NULL if the store is empty.
+char* shapes_editor_get_shape_ids(void);
 
 /// Free a C string returned by shapes_editor_get_shape_ids().
 void shapes_editor_free_string(char* ptr);
 
-/// Return all points for a single shape in store_id as a heap-allocated FFIShapePoint array.
+/// Return all points for a single shape as a heap-allocated FFIShapePoint array.
 /// Sets *out_count. Returns NULL if the shape does not exist.
 /// Free with shapes_editor_free_points().
-FFIShapePoint* shapes_editor_get_shape(uint32_t store_id, const char* shape_id, size_t* out_count);
+FFIShapePoint* shapes_editor_get_shape(const char* shape_id, size_t* out_count);
 
-/// Return the total number of points currently held in store_id.
-size_t shapes_editor_point_count(uint32_t store_id);
+/// Return the total number of points currently held in the editor store.
+size_t shapes_editor_point_count(void);
 
 /// Move an existing point identified by (shape_id, sequence) to new coordinates.
 /// Returns 1 if found and updated, 0 if not found.
-int32_t shapes_editor_update_point(uint32_t store_id, const char* shape_id,
-                                    uint32_t sequence,
+int32_t shapes_editor_update_point(const char* shape_id, uint32_t sequence,
                                     double new_lat, double new_lon);
 
-/// Delete the point at (shape_id, sequence) in store_id.
+/// Delete the point at (shape_id, sequence).
 /// Automatically removes the parent shape entry when it becomes empty.
 /// Returns 1 if deleted, 0 if not found.
-int32_t shapes_editor_delete_point(uint32_t store_id, const char* shape_id,
-                                    uint32_t sequence);
+int32_t shapes_editor_delete_point(const char* shape_id, uint32_t sequence);
 
-/// Insert a new point into shape_id in store_id immediately after after_sequence.
+/// Insert a new point into shape_id immediately after after_sequence.
 /// All points in the shape with sequence >= (after_sequence + 1) are renumbered +1.
 /// Returns 1 on success, 0 on invalid arguments.
-int32_t shapes_editor_insert_point(uint32_t store_id, const char* shape_id,
-                                    uint32_t after_sequence,
+int32_t shapes_editor_insert_point(const char* shape_id, uint32_t after_sequence,
                                     double lat, double lon);
 
-/// Delete an entire shape and all its points from store_id.
+/// Delete an entire shape and all its points.
 /// Returns 1 if the shape existed and was deleted, 0 if not found.
-int32_t shapes_editor_delete_shape(uint32_t store_id, const char* shape_id);
+int32_t shapes_editor_delete_shape(const char* shape_id);
 
-/// Register a new empty shape in store_id so it appears in the editor immediately.
+/// Register a new empty shape so it appears in the editor immediately.
 /// Returns 1 if created, 0 if a shape with that ID already exists.
-int32_t shapes_editor_add_shape(uint32_t store_id, const char* shape_id);
+int32_t shapes_editor_add_shape(const char* shape_id);
 
-/// Clear all loaded data from store_id (does not close or free the store).
-void shapes_editor_reset(uint32_t store_id);
+/// Clear all data from the editor store (does not affect the GTFS pipeline).
+void shapes_editor_reset(void);
 
 /// Free an FFIShapePoint array returned by any shapes_editor_* function.
 void shapes_editor_free_points(FFIShapePoint* ptr, size_t count);
