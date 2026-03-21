@@ -2,29 +2,28 @@
 ///
 /// # Multi-store design
 ///
-/// Each GTFS static feed (Amtrak, SEPTA, NJT, …) gets its own
-/// `GtfsStaticStore` identified by a `u32` store_id.  Store IDs are handed out
-/// by `gtfs_static_store_new()` and released by `gtfs_static_store_free()`.
+/// Each GTFS static feed gets its own `GtfsStaticStore` identified by a
+/// `u32` store_id.  Store IDs are handed out by `gtfs_static_store_new()` and
+/// released by `gtfs_static_store_free()`.
 ///
 /// # Backward compatibility
 ///
 /// The original singleton functions (`gtfs_static_feed_eocd`,
 /// `gtfs_static_feed_file`, `gtfs_static_lookup`, …) are preserved unchanged.
-/// They route to a hidden **legacy store** (`LEGACY_STORE_ID = 1`) so existing
-/// Amtrak Swift code requires zero changes.
+/// They route to a hidden **legacy store** (`LEGACY_STORE_ID = 1`).
 ///
 /// # Per-store trip-id strategy
 ///
-/// Different agencies encode the human-readable train/run number in different
-/// fields.  Each store carries a `TripIdStrategy` that controls how
-/// `parse_trips` and `lookup` extract a display label:
+/// GTFS feeds encode the operator-visible run number in different fields
+/// depending on the agency.  Each store carries a `TripIdStrategy` that
+/// controls how `parse_trips` and `lookup` extract a display label:
 ///
-/// | Strategy        | Agencies          | Source of train number           |
-/// |-----------------|-------------------|----------------------------------|
-/// | `ShortName`     | Amtrak, SJJPA     | `trip_short_name` (or `trip_id`) |
-/// | `SeptaTripId`   | SEPTA Regional    | digits after leading alpha prefix |
-/// | `RouteShortName`| NJT, MBTA, etc.   | `route_short_name`               |
-/// | `Opaque`        | any               | `trip_id` verbatim               |
+/// | Strategy              | GTFS source                                      |
+/// |-----------------------|--------------------------------------------------|
+/// | `TripShortName`       | `trip_short_name` field (or `trip_id` if absent) |
+/// | `TripIdNumericSuffix` | digits after leading alpha prefix in `trip_id`   |
+/// | `RouteShortName`      | `route_short_name` field                         |
+/// | `TripIdVerbatim`      | `trip_id` as-is                                  |
 ///
 /// # ZIP loading protocol (unchanged)
 ///
@@ -51,44 +50,54 @@ const LEGACY_STORE_ID: u32 = 1;
 
 // ── Trip-ID extraction strategy ──────────────────────────────────────────────
 
-/// Controls how a store extracts a human-readable train/run number from
-/// `trips.txt` for display in the UI.
+/// Controls how a store maps a `trips.txt` row to a human-readable run number
+/// for display in the UI.
 ///
-/// Set via `gtfs_static_store_set_strategy()` before feeding any files.
-/// Defaults to `ShortName` (Amtrak-compatible).
+/// GTFS feeds encode the operator-facing run/trip number in different fields
+/// depending on the agency.  This enum selects the extraction rule that best
+/// matches the feed being loaded.  Set via `gtfs_static_store_set_strategy()`
+/// **before** feeding any files.  Defaults to `TripShortName`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TripIdStrategy {
-    /// Use `trip_short_name` as the train number; fall back to `trip_id`.
-    /// Correct for Amtrak and Gold Runner / SJJPA.
-    ShortName = 0,
-
-    /// SEPTA Regional Rail: `trip_id` is `{LINE}{RUN}_{DATE}_{SID}`.
-    /// e.g. `CYN1052_20260201_SID185189` → train_number = `"1052"`,
-    /// and `route_short_name` (or `route_long_name`) provides the line name.
+    /// Prefer `trip_short_name`; fall back to `trip_id` verbatim.
     ///
-    /// Splitting on `_` and taking the first token gives `CYN1052`.
-    /// The leading alphabetic prefix is the line code; the remaining digits
-    /// are the run number that `staticInfo.trainNumber` should display.
-    SeptaTripId = 1,
+    /// Use this when `trip_short_name` is the operator-visible run number
+    /// (e.g. "168", "704").  This is the most common case and the GTFS spec's
+    /// intended purpose for that field.
+    TripShortName = 0,
 
-    /// Agencies where neither `trip_short_name` nor `trip_id` carry a
-    /// meaningful run number (NJT, MBTA commuter rail, etc.).
-    /// `route_short_name` is used as the line label; `train_number` will be
-    /// the raw `trip_id` (callers should treat it as opaque / hide it).
+    /// Extract the leading numeric suffix from the first underscore-delimited
+    /// token of `trip_id`.
+    ///
+    /// Some feeds embed the run number inside `trip_id` using the pattern
+    /// `{LINE_CODE}{RUN}_{DATE}_{OTHER}`, e.g. `CYN1052_20260201_SID185189`.
+    /// This strategy splits on `_`, takes the first token (`CYN1052`), strips
+    /// any leading alphabetic prefix (`CYN`), and returns the remaining digits
+    /// (`1052`) as the run number.  Falls back to the full first token when no
+    /// digits are found.
+    TripIdNumericSuffix = 1,
+
+    /// Use `route_short_name` as the display label; `trip_id` is opaque.
+    ///
+    /// Use this when `trip_short_name` is absent or meaningless and the most
+    /// useful label for the operator is the route's short name (e.g. "R5",
+    /// "Paoli/Thorndale").
     RouteShortName = 2,
 
-    /// Fully opaque: expose `trip_id` verbatim as `train_number`.
-    /// Useful for debugging and for agencies with truly unique trip_ids.
-    Opaque = 3,
+    /// Expose `trip_id` verbatim as the run number with no transformation.
+    ///
+    /// Use this as a catch-all when none of the above strategies produce a
+    /// meaningful display value.
+    TripIdVerbatim = 3,
 }
 
 impl TripIdStrategy {
     fn from_i32(v: i32) -> Self {
         match v {
-            1 => TripIdStrategy::SeptaTripId,
+            1 => TripIdStrategy::TripIdNumericSuffix,
             2 => TripIdStrategy::RouteShortName,
-            3 => TripIdStrategy::Opaque,
-            _ => TripIdStrategy::ShortName,
+            3 => TripIdStrategy::TripIdVerbatim,
+            _ => TripIdStrategy::TripShortName,
         }
     }
 }
@@ -103,14 +112,14 @@ struct Registry {
 impl Registry {
     fn new() -> Self {
         let mut r = Registry { stores: HashMap::new(), next_id: 2 }; // 1 = legacy
-        r.stores.insert(LEGACY_STORE_ID, GtfsStaticStore::new(TripIdStrategy::ShortName));
+        r.stores.insert(LEGACY_STORE_ID, GtfsStaticStore::new(TripIdStrategy::TripShortName));
         r
     }
 
     fn open(&mut self) -> u32 {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(2);
-        self.stores.insert(id, GtfsStaticStore::new(TripIdStrategy::ShortName));
+        self.stores.insert(id, GtfsStaticStore::new(TripIdStrategy::TripShortName));
         id
     }
 
@@ -149,6 +158,35 @@ struct GtfsStaticStore {
     trip_shape_ids:    HashMap<String, String>,
     trip_stop_seqs:    HashMap<String, TripStopSequence>,
     shape_timelines:   HashMap<String, TripShapeTimeline>,
+    // ── Service-day support ───────────────────────────────────────────────────
+    /// trip_id → service_id (from trips.txt)
+    trip_service_ids:  HashMap<String, String>,
+    /// trip_id → direction_id (0 or 1; u8::MAX = absent)
+    trip_direction_ids: HashMap<String, u8>,
+    /// trip_id → trip_headsign
+    trip_headsigns:    HashMap<String, String>,
+    /// trip_id → block_id (for through-service / in-seat transfers)
+    trip_block_ids:    HashMap<String, String>,
+    /// service_id → CalendarRecord (from calendar.txt)
+    calendar:          HashMap<String, CalendarRecord>,
+    /// (service_id, date_yyyymmdd) → exception_type (1=added, 2=removed)
+    calendar_dates:    HashMap<(String, u32), u8>,
+    /// (trip_id, stop_sequence) → (pickup_type, dropoff_type) for non-revenue stops
+    stop_pickup_types: HashMap<(String, u32), (u8, u8)>,
+}
+
+/// One row from calendar.txt.
+#[derive(Debug, Clone)]
+struct CalendarRecord {
+    monday:    bool,
+    tuesday:   bool,
+    wednesday: bool,
+    thursday:  bool,
+    friday:    bool,
+    saturday:  bool,
+    sunday:    bool,
+    start_date: u32, // YYYYMMDD
+    end_date:   u32, // YYYYMMDD
 }
 
 #[derive(Debug, Clone)]
@@ -163,16 +201,23 @@ impl GtfsStaticStore {
     fn new(strategy: TripIdStrategy) -> Self {
         Self {
             strategy,
-            route_names:       HashMap::new(),
-            route_short_names: HashMap::new(),
-            trips:             HashMap::new(),
-            trip_windows:      HashMap::new(),
-            cd_entries:        HashMap::new(),
-            shape_points:      HashMap::new(),
-            stop_latlon:       HashMap::new(),
-            trip_shape_ids:    HashMap::new(),
-            trip_stop_seqs:    HashMap::new(),
-            shape_timelines:   HashMap::new(),
+            route_names:        HashMap::new(),
+            route_short_names:  HashMap::new(),
+            trips:              HashMap::new(),
+            trip_windows:       HashMap::new(),
+            cd_entries:         HashMap::new(),
+            shape_points:       HashMap::new(),
+            stop_latlon:        HashMap::new(),
+            trip_shape_ids:     HashMap::new(),
+            trip_stop_seqs:     HashMap::new(),
+            shape_timelines:    HashMap::new(),
+            trip_service_ids:   HashMap::new(),
+            trip_direction_ids: HashMap::new(),
+            trip_headsigns:     HashMap::new(),
+            trip_block_ids:     HashMap::new(),
+            calendar:           HashMap::new(),
+            calendar_dates:     HashMap::new(),
+            stop_pickup_types:  HashMap::new(),
         }
     }
 
@@ -200,7 +245,10 @@ impl GtfsStaticStore {
         None
     }
 
-    fn is_trip_active(&self, trip_id: &str, now_eastern: i64) -> bool {
+    fn is_trip_active(&self, trip_id: &str, now_local: i64) -> bool {
+        // Resolve RT-mangled trip_id: some feeds prefix the static trip_id
+        // with date or agency tokens separated by underscores.  If the full
+        // trip_id is not in the table, try the last underscore-delimited token.
         let canonical = if self.trip_windows.contains_key(trip_id) {
             trip_id.to_string()
         } else if trip_id.contains('_') {
@@ -209,26 +257,101 @@ impl GtfsStaticStore {
             trip_id.to_string()
         };
 
-        let Some(&(first_dep, last_arr)) = self.trip_windows.get(canonical.as_str()) else {
+        // ── Step 1: time-window gate (fast pre-filter) ────────────────────────
+        // Reject trips whose entire scheduled span (plus a generous delay
+        // buffer) cannot possibly contain now_local.
+        //
+        // We only look back 1 calendar day (enough for overnight trips that
+        // started before midnight) — a 3-day lookback was too broad and could
+        // match trips from days ago within their scheduled window.
+        const DELAY_BUFFER_SECS: u32 = 2 * 60 * 60; // 2 hours late tolerance
+        const SECS_PER_DAY:      i64 = 86_400;
+
+        let in_time_window = if let Some(&(first_dep, last_arr)) = self.trip_windows.get(canonical.as_str()) {
+            let window_end = last_arr.saturating_add(DELAY_BUFFER_SECS);
+            let mut found = false;
+            for days_ago in 0i64..=1 {
+                let midnight  = (now_local / SECS_PER_DAY - days_ago) * SECS_PER_DAY;
+                let abs_start = midnight + first_dep as i64;
+                let abs_end   = midnight + window_end as i64;
+                if now_local >= abs_start && now_local <= abs_end {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        } else {
+            // No time window loaded → pass-through (data not yet fully loaded).
             return true;
         };
 
-        const DELAY_BUFFER_SECS: u32 = 2 * 60 * 60;
-        const SECS_PER_DAY:      i64 = 86_400;
-
-        let window_end = last_arr.saturating_add(DELAY_BUFFER_SECS);
-        for days_ago in 0i64..=3 {
-            let midnight  = (now_eastern / SECS_PER_DAY - days_ago) * SECS_PER_DAY;
-            let abs_start = midnight + first_dep as i64;
-            let abs_end   = midnight + window_end as i64;
-            if now_eastern >= abs_start && now_eastern <= abs_end {
-                return true;
-            }
+        if !in_time_window {
+            return false;
         }
-        false
+
+        // ── Step 2: service-day check via calendar.txt / calendar_dates.txt ───
+        // If calendar data is not loaded yet, fall through to true so we don't
+        // suppress real-time vehicles while the static feed is still loading.
+        if self.calendar.is_empty() && self.calendar_dates.is_empty() {
+            return true;
+        }
+
+        let service_id = match self.trip_service_ids.get(canonical.as_str())
+            .or_else(|| self.trip_service_ids.get(trip_id))
+        {
+            Some(s) => s,
+            None    => return true, // unknown trip → pass-through
+        };
+
+        // Determine the "service date" — trips running after midnight on GTFS
+        // extended times still belong to the previous service date.  We use
+        // the first_dep to decide: if (now_local % 86400) < first_dep the
+        // trip started on the previous calendar day.
+        let first_dep_secs = self.trip_windows.get(canonical.as_str()).map(|w| w.0).unwrap_or(0);
+        let now_sod = (now_local % SECS_PER_DAY) as u32; // seconds since midnight (local)
+        // If the vehicle is past midnight (now_sod < first_dep after 24h wrap),
+        // the service date was yesterday.
+        let days_offset: i64 = if first_dep_secs >= 86400 && now_sod < first_dep_secs % 86400 {
+            -1 // still on yesterday's service date
+        } else {
+            0
+        };
+        let service_date_midnight = (now_local / SECS_PER_DAY + days_offset) * SECS_PER_DAY;
+        let service_date_yyyymmdd = local_midnight_to_yyyymmdd(service_date_midnight);
+
+        // calendar_dates.txt exceptions override calendar.txt rules.
+        let key = (service_id.clone(), service_date_yyyymmdd);
+        match self.calendar_dates.get(&key) {
+            Some(&1) => return true,  // exception_type=1: service ADDED on this date
+            Some(&2) => return false, // exception_type=2: service REMOVED on this date
+            _        => {}
+        }
+
+        // calendar.txt: check day-of-week and date range.
+        if let Some(cal) = self.calendar.get(service_id.as_str()) {
+            if service_date_yyyymmdd < cal.start_date || service_date_yyyymmdd > cal.end_date {
+                return false;
+            }
+            // Day-of-week check using Tomohiko Sakamoto's algorithm (no std::time needed).
+            let dow = day_of_week_from_yyyymmdd(service_date_yyyymmdd);
+            return match dow {
+                0 => cal.sunday,
+                1 => cal.monday,
+                2 => cal.tuesday,
+                3 => cal.wednesday,
+                4 => cal.thursday,
+                5 => cal.friday,
+                6 => cal.saturday,
+                _ => false,
+            };
+        }
+
+        // service_id not found in calendar.txt — if it had no calendar_dates
+        // entry either, we have no data.  Pass-through to avoid hiding trains.
+        true
     }
 
-    fn interpolate_position(&mut self, trip_id: &str, now_eastern: i64) -> Option<(f64, f64)> {
+    fn interpolate_position(&mut self, trip_id: &str, now_local: i64) -> Option<(f64, f64)> {
         let canonical = self.resolve_trip_id_for_shape(trip_id)?;
 
         if !self.shape_timelines.contains_key(canonical.as_str()) {
@@ -240,9 +363,19 @@ impl GtfsStaticStore {
         }
 
         let timeline = self.shape_timelines.get(canonical.as_str())?;
-        let since_midnight = now_eastern % 86_400;
+
+        // GTFS stop_times allow times ≥ 24:00:00 (extended times for
+        // trips that run past midnight).  The timeline's time_at_point values
+        // are raw seconds-since-schedule-midnight and can exceed 86 400.
+        //
+        // Strategy: compute seconds-since-midnight and try the current service
+        // day.  If that fails, try +86400 (the trip started before midnight on
+        // the previous schedule day) and +172800 (two days — uncommon but
+        // technically valid GTFS).  Stop at the first hit.
+        let since_midnight = now_local % 86_400;
         query_position(timeline, since_midnight)
             .or_else(|| query_position(timeline, since_midnight + 86_400))
+            .or_else(|| query_position(timeline, since_midnight + 172_800))
     }
 
     fn resolve_trip_id_for_shape(&self, trip_id: &str) -> Option<String> {
@@ -273,6 +406,48 @@ impl GtfsStaticStore {
         let strategy = self.strategy; // preserve strategy
         *self = GtfsStaticStore::new(strategy);
     }
+}
+
+// ── Calendar helper functions ─────────────────────────────────────────────────
+
+/// Convert a local-midnight POSIX timestamp to a YYYYMMDD integer.
+///
+/// `midnight_local` must equal `unix_ts + tz_offset_seconds` so that
+/// integer division by 86 400 yields the correct local calendar date.
+/// No timezone logic is performed here — this is pure Gregorian arithmetic.
+fn local_midnight_to_yyyymmdd(midnight_local: i64) -> u32 {
+    // Days since Unix epoch (1970-01-01).
+    let days = (midnight_local / 86_400) as i32;
+    // Gregorian calendar conversion (proleptic, works for 1970-2100).
+    let z     = days + 719_468;
+    let era   = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe   = z - era * 146_097;                     // day of era [0, 146096]
+    let yoe   = (doe - doe/1460 + doe/36524 - doe/146096) / 365; // year of era [0, 399]
+    let y     = yoe + era * 400;
+    let doy   = doe - (365*yoe + yoe/4 - yoe/100);    // day of year [0, 365]
+    let mp    = (5*doy + 2)/153;                       // month prime [0, 11]
+    let d     = doy - (153*mp+2)/5 + 1;               // day [1, 31]
+    let m     = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let y_adj = if m <= 2 { y + 1 } else { y };
+    (y_adj * 10_000 + m * 100 + d) as u32
+}
+
+/// Return the day of week for a YYYYMMDD date (0=Sunday … 6=Saturday).
+/// Uses Tomohiko Sakamoto's algorithm.
+fn day_of_week_from_yyyymmdd(yyyymmdd: u32) -> u8 {
+    let y0 = (yyyymmdd / 10_000) as i32;
+    let m0 = ((yyyymmdd / 100) % 100) as i32;
+    let d  = (yyyymmdd % 100) as i32;
+    static T: [i32; 12] = [0,3,2,5,0,3,5,1,4,6,2,4];
+    let y = if m0 < 3 { y0 - 1 } else { y0 };
+    ((y + y/4 - y/100 + y/400 + T[(m0-1) as usize] + d) % 7) as u8
+}
+
+/// Parse a YYYYMMDD string into a u32 integer.  Returns 0 on failure.
+fn parse_yyyymmdd(s: &str) -> u32 {
+    let s = s.trim();
+    if s.len() != 8 { return 0; }
+    s.parse::<u32>().unwrap_or(0)
 }
 
 // ── Shape interpolation types ─────────────────────────────────────────────────
@@ -427,7 +602,8 @@ fn parse_eocd_into(data: &[u8], store: &mut GtfsStaticStore) -> Result<Vec<(Stri
         entries.insert(fname, CdEntry { local_header_offset, compressed_size, uncompressed_size, method });
     }
 
-    let targets = ["trips.txt", "routes.txt", "stop_times.txt", "stops.txt", "shapes.txt"];
+    let targets = ["trips.txt", "routes.txt", "stop_times.txt", "stops.txt", "shapes.txt",
+        "calendar.txt", "calendar_dates.txt"];
     let mut ranges = Vec::new();
     for target in &targets {
         if let Some(entry) = entries.get(*target) {
@@ -536,7 +712,7 @@ fn parse_stop_sequences(
             _ => continue,
         };
         let stop_id = rec.get(stop_id_idx).unwrap_or("").trim().to_string();
-        let seq: u32 = seq_idx.and_then(|i| rec.get(i)).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let seq: u32 = parse_col_u32(seq_idx, &rec);
         let Some(time) = resolve_stop_time(&rec, dep_idx, arr_idx) else { continue };
         rows.push(RawRow { trip_id, seq, stop_id, time });
     }
@@ -556,14 +732,19 @@ fn parse_stop_sequences(
 }
 
 /// Returns (display_names, short_names).
+/// Per spec, either route_short_name or route_long_name must be present —
+/// both are optional individually.  We accept feeds that provide only one.
 fn parse_routes(data: &[u8]) -> Result<(HashMap<String, String>, HashMap<String, String>), String> {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
     let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
-    let route_id_idx   = headers.iter().position(|h| h == "route_id")
+    let route_id_idx    = headers.iter().position(|h| h == "route_id")
         .ok_or("routes.txt: missing route_id column")?;
     let route_short_idx = headers.iter().position(|h| h == "route_short_name");
-    let route_long_idx  = headers.iter().position(|h| h == "route_long_name")
-        .ok_or("routes.txt: missing route_long_name column")?;
+    let route_long_idx  = headers.iter().position(|h| h == "route_long_name");
+
+    if route_short_idx.is_none() && route_long_idx.is_none() {
+        return Err("routes.txt: missing both route_short_name and route_long_name".into());
+    }
 
     let mut display_names: HashMap<String, String> = HashMap::new();
     let mut short_names:   HashMap<String, String> = HashMap::new();
@@ -573,20 +754,33 @@ fn parse_routes(data: &[u8]) -> Result<(HashMap<String, String>, HashMap<String,
         let route_id = record.get(route_id_idx).unwrap_or("").trim().to_string();
         if route_id.is_empty() { continue; }
         let short = route_short_idx.and_then(|i| record.get(i)).unwrap_or("").trim().to_string();
-        let long  = record.get(route_long_idx).unwrap_or("").trim().to_string();
+        let long  = route_long_idx.and_then(|i| record.get(i)).unwrap_or("").trim().to_string();
+        // Display name: prefer short if non-empty, fall back to long.
+        // Per best practices, route_long_name should not repeat route_short_name
+        // but we just pick the most useful non-empty value for display.
         let display = if !short.is_empty() { short.clone() } else { long };
-        display_names.insert(route_id.clone(), display);
+        if !display.is_empty() {
+            display_names.insert(route_id.clone(), display);
+        }
         if !short.is_empty() { short_names.insert(route_id, short); }
     }
     Ok((display_names, short_names))
 }
 
 /// Parse trips.txt, applying the store's strategy for train-number extraction.
+/// Returns (trips_map, shape_id_map, service_id_map, direction_id_map, headsign_map, block_id_map).
 fn parse_trips_with_strategy(
     data:              &[u8],
     strategy:          TripIdStrategy,
     route_short_names: &HashMap<String, String>,
-) -> Result<(HashMap<String, (String, String)>, HashMap<String, String>), String> {
+) -> Result<(
+    HashMap<String, (String, String)>, // trip_id → (train_num, route_id)
+    HashMap<String, String>,           // trip_id → shape_id
+    HashMap<String, String>,           // trip_id → service_id
+    HashMap<String, u8>,               // trip_id → direction_id (u8::MAX = absent)
+    HashMap<String, String>,           // trip_id → trip_headsign
+    HashMap<String, String>,           // trip_id → block_id
+), String> {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
     let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
 
@@ -594,18 +788,34 @@ fn parse_trips_with_strategy(
         .ok_or("trips.txt: missing trip_id column")?;
     let route_id_idx   = headers.iter().position(|h| h == "route_id")
         .ok_or("trips.txt: missing route_id column")?;
-    let short_name_idx = headers.iter().position(|h| h == "trip_short_name");
-    let shape_id_idx   = headers.iter().position(|h| h == "shape_id");
+    let service_id_idx = headers.iter().position(|h| h == "service_id")
+        .ok_or("trips.txt: missing service_id column")?;
+    let short_name_idx  = headers.iter().position(|h| h == "trip_short_name");
+    let shape_id_idx    = headers.iter().position(|h| h == "shape_id");
+    let direction_id_idx= headers.iter().position(|h| h == "direction_id");
+    let headsign_idx    = headers.iter().position(|h| h == "trip_headsign");
+    let block_id_idx    = headers.iter().position(|h| h == "block_id");
 
-    let mut trips_map:    HashMap<String, (String, String)> = HashMap::new();
-    let mut shape_id_map: HashMap<String, String>           = HashMap::new();
+    let mut trips_map:      HashMap<String, (String, String)> = HashMap::new();
+    let mut shape_id_map:   HashMap<String, String>           = HashMap::new();
+    let mut service_id_map: HashMap<String, String>           = HashMap::new();
+    let mut direction_map:  HashMap<String, u8>               = HashMap::new();
+    let mut headsign_map:   HashMap<String, String>           = HashMap::new();
+    let mut block_id_map:   HashMap<String, String>           = HashMap::new();
 
     for result in rdr.records() {
         let record     = result.map_err(|e| e.to_string())?;
         let trip_id    = record.get(trip_id_idx).unwrap_or("").trim().to_string();
         let route_id   = record.get(route_id_idx).unwrap_or("").trim().to_string();
+        let service_id = record.get(service_id_idx).unwrap_or("").trim().to_string();
         let shape_id   = shape_id_idx.and_then(|i| record.get(i)).unwrap_or("").trim().to_string();
         let short_name = short_name_idx.and_then(|i| record.get(i)).unwrap_or("").trim().to_string();
+        let headsign   = headsign_idx.and_then(|i| record.get(i)).unwrap_or("").trim().to_string();
+        let block_id   = block_id_idx.and_then(|i| record.get(i)).unwrap_or("").trim().to_string();
+        let direction_id: u8 = direction_id_idx
+            .and_then(|i| record.get(i))
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            .unwrap_or(u8::MAX);
 
         if trip_id.is_empty() { continue; }
 
@@ -617,17 +827,122 @@ fn parse_trips_with_strategy(
             trips_map.entry(sec).or_insert((train_num.clone(), route_id.clone()));
         }
         if !shape_id.is_empty() {
-            shape_id_map.insert(trip_id, shape_id);
+            shape_id_map.insert(trip_id.clone(), shape_id);
+        }
+        if !service_id.is_empty() {
+            service_id_map.insert(trip_id.clone(), service_id);
+        }
+        if direction_id != u8::MAX {
+            direction_map.insert(trip_id.clone(), direction_id);
+        }
+        if !headsign.is_empty() {
+            headsign_map.insert(trip_id.clone(), headsign);
+        }
+        if !block_id.is_empty() {
+            block_id_map.insert(trip_id.clone(), block_id);
         }
     }
-    Ok((trips_map, shape_id_map))
+    Ok((trips_map, shape_id_map, service_id_map, direction_map, headsign_map, block_id_map))
 }
 
-/// Strategy-dispatched train-number extraction.
-///
+/// Parse calendar.txt → service_id → CalendarRecord.
+fn parse_calendar(data: &[u8]) -> Result<HashMap<String, CalendarRecord>, String> {
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
+    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
+    let sid_idx   = csv_col(&headers, "service_id")?;
+    let mon_idx   = csv_col(&headers, "monday")?;
+    let tue_idx   = csv_col(&headers, "tuesday")?;
+    let wed_idx   = csv_col(&headers, "wednesday")?;
+    let thu_idx   = csv_col(&headers, "thursday")?;
+    let fri_idx   = csv_col(&headers, "friday")?;
+    let sat_idx   = csv_col(&headers, "saturday")?;
+    let sun_idx   = csv_col(&headers, "sunday")?;
+    let start_idx = csv_col(&headers, "start_date")?;
+    let end_idx   = csv_col(&headers, "end_date")?;
+
+    let parse_bool = |s: &str| s.trim() == "1";
+
+    let mut map = HashMap::new();
+    for result in rdr.records() {
+        let rec = result.map_err(|e| e.to_string())?;
+        let sid = rec.get(sid_idx).unwrap_or("").trim().to_string();
+        if sid.is_empty() { continue; }
+        let start_date = parse_yyyymmdd(rec.get(start_idx).unwrap_or(""));
+        let end_date   = parse_yyyymmdd(rec.get(end_idx).unwrap_or(""));
+        if start_date == 0 || end_date == 0 { continue; }
+        map.insert(sid, CalendarRecord {
+            monday:    parse_bool(rec.get(mon_idx).unwrap_or("0")),
+            tuesday:   parse_bool(rec.get(tue_idx).unwrap_or("0")),
+            wednesday: parse_bool(rec.get(wed_idx).unwrap_or("0")),
+            thursday:  parse_bool(rec.get(thu_idx).unwrap_or("0")),
+            friday:    parse_bool(rec.get(fri_idx).unwrap_or("0")),
+            saturday:  parse_bool(rec.get(sat_idx).unwrap_or("0")),
+            sunday:    parse_bool(rec.get(sun_idx).unwrap_or("0")),
+            start_date,
+            end_date,
+        });
+    }
+    Ok(map)
+}
+
+/// Parse calendar_dates.txt → (service_id, date_yyyymmdd) → exception_type.
+/// exception_type: 1=service added, 2=service removed.
+fn parse_calendar_dates(data: &[u8]) -> Result<HashMap<(String, u32), u8>, String> {
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
+    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
+    let sid_idx  = csv_col(&headers, "service_id")?;
+    let date_idx = csv_col(&headers, "date")?;
+    let type_idx = csv_col(&headers, "exception_type")?;
+
+    let mut map = HashMap::new();
+    for result in rdr.records() {
+        let rec  = result.map_err(|e| e.to_string())?;
+        let sid  = rec.get(sid_idx).unwrap_or("").trim().to_string();
+        let date = parse_yyyymmdd(rec.get(date_idx).unwrap_or(""));
+        let etype: u8 = rec.get(type_idx).unwrap_or("0").trim().parse().unwrap_or(0);
+        if sid.is_empty() || date == 0 || etype == 0 { continue; }
+        map.insert((sid, date), etype);
+    }
+    Ok(map)
+}
+
+/// Parse stop_times.txt for pickup_type / dropoff_type per (trip_id, stop_sequence).
+/// Returns only rows where at least one type is non-zero (non-regular service).
+/// Used to filter non-revenue stops from next-stop results.
+fn parse_stop_pickup_types(data: &[u8]) -> Result<HashMap<(String, u32), (u8, u8)>, String> {
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
+    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
+    let trip_id_idx  = csv_col(&headers, "trip_id")?;
+    let seq_idx      = headers.iter().position(|h| h == "stop_sequence");
+    let pickup_idx   = headers.iter().position(|h| h == "pickup_type");
+    let dropoff_idx  = headers.iter().position(|h| h == "drop_off_type");
+
+    // If neither pickup nor dropoff columns exist, return empty (all regular).
+    if pickup_idx.is_none() && dropoff_idx.is_none() {
+        return Ok(HashMap::new());
+    }
+
+    let mut map = HashMap::new();
+    for result in rdr.records() {
+        let rec = result.map_err(|e| e.to_string())?;
+        let trip_id = match rec.get(trip_id_idx) {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => continue,
+        };
+        let seq:    u32 = parse_col_u32(seq_idx,    &rec);
+        let pickup:  u8 = parse_col_u32(pickup_idx,  &rec) as u8;
+        let dropoff: u8 = parse_col_u32(dropoff_idx, &rec) as u8;
+        // Only store non-default rows to keep memory usage low.
+        if pickup != 0 || dropoff != 0 {
+            map.insert((trip_id, seq), (pickup, dropoff));
+        }
+    }
+    Ok(map)
+}
 /// Returns `(train_number, secondary_key)`.
-/// `secondary_key` is an extra alias to insert into the trips table so that
-/// mangled RT trip_ids (e.g. Amtrak's `_AMTK_<short>` prefix) can still hit.
+/// `secondary_key` is an extra alias inserted into the trips table so that
+/// RT trip_ids with a prefixed format (e.g. `"{DATE}_{STATIC_ID}"`) can still
+/// resolve via the underscore-split fallback in `lookup()`.
 fn extract_train_number(
     strategy:          TripIdStrategy,
     trip_id:           &str,
@@ -636,14 +951,17 @@ fn extract_train_number(
     route_short_names: &HashMap<String, String>,
 ) -> (String, Option<String>) {
     match strategy {
-        TripIdStrategy::ShortName => {
-            // Amtrak / Gold Runner: trip_short_name is canonical.
-            // Fall back to trip_id (existing behavior).
+        TripIdStrategy::TripShortName => {
+            // Prefer trip_short_name (the GTFS-spec field for operator run numbers).
+            // Fall back to trip_id when trip_short_name is absent.
             let train_num = if !short_name.is_empty() {
                 short_name.to_string()
             } else {
                 trip_id.to_string()
             };
+            // Insert a secondary alias keyed on the short name so RT feeds
+            // that prefix trip_ids (e.g. "{DATE}_{SHORT}") still hit the table
+            // via the underscore-split fallback in lookup().
             let secondary = if !short_name.is_empty() && short_name != trip_id {
                 Some(short_name.to_string())
             } else {
@@ -652,9 +970,11 @@ fn extract_train_number(
             (train_num, secondary)
         }
 
-        TripIdStrategy::SeptaTripId => {
-            // SEPTA: trip_id = "CYN1052_20260201_SID185189"
-            // First token = "CYN1052"; leading alpha = line code, trailing digits = run.
+        TripIdStrategy::TripIdNumericSuffix => {
+            // Some feeds embed the run number inside trip_id as
+            // "{LINE_CODE}{RUN}_{DATE}_{OTHER}".  Take the first
+            // underscore-delimited token, strip any leading alphabetic
+            // prefix (the line/route code), and return the remaining digits.
             let first_token = trip_id.split('_').next().unwrap_or(trip_id);
             let digit_start = first_token.find(|c: char| c.is_ascii_digit())
                 .unwrap_or(first_token.len());
@@ -664,7 +984,8 @@ fn extract_train_number(
         }
 
         TripIdStrategy::RouteShortName => {
-            // Agencies where the route short name is the meaningful label.
+            // Use route_short_name as the display label when trip_short_name
+            // is absent and trip_id is opaque.
             let train_num = route_short_names
                 .get(route_id)
                 .cloned()
@@ -672,7 +993,7 @@ fn extract_train_number(
             (train_num, None)
         }
 
-        TripIdStrategy::Opaque => {
+        TripIdStrategy::TripIdVerbatim => {
             (trip_id.to_string(), None)
         }
     }
@@ -728,6 +1049,15 @@ fn csv_col(headers: &csv::StringRecord, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("missing column '{}'", name))
 }
 
+/// Parse a single optional CSV column as `u32`, returning 0 when absent or unparseable.
+/// Eliminates the repeated `idx.and_then(|i| rec.get(i)).and_then(|s| s.trim().parse().ok()).unwrap_or(0)` pattern.
+#[inline]
+fn parse_col_u32(idx: Option<usize>, rec: &csv::StringRecord) -> u32 {
+    idx.and_then(|i| rec.get(i))
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 // ── Internal file-feed dispatcher ─────────────────────────────────────────────
 
 /// Decompress and ingest one GTFS file into a store.
@@ -753,7 +1083,7 @@ fn feed_file_into(store: &mut GtfsStaticStore, fname: &str, slice: &[u8]) -> i32
     match fname {
         "routes.txt" => match parse_routes(&decompressed) {
             Ok((display, short)) => {
-                // or_insert: first feed wins on collision (Amtrak is authoritative).
+                // or_insert: first feed loaded wins on route_id collisions.
                 for (k, v) in display { store.route_names.entry(k).or_insert(v); }
                 for (k, v) in short   { store.route_short_names.entry(k).or_insert(v); }
                 0
@@ -767,9 +1097,13 @@ fn feed_file_into(store: &mut GtfsStaticStore, fname: &str, slice: &[u8]) -> i32
             let strategy          = store.strategy;
             let route_short_names = store.route_short_names.clone();
             match parse_trips_with_strategy(&decompressed, strategy, &route_short_names) {
-                Ok((trips_map, shape_id_map)) => {
-                    for (k, v) in trips_map    { store.trips.entry(k).or_insert(v); }
-                    for (k, v) in shape_id_map { store.trip_shape_ids.entry(k).or_insert(v); }
+                Ok((trips_map, shape_id_map, service_id_map, direction_map, headsign_map, block_id_map)) => {
+                    for (k, v) in trips_map     { store.trips.entry(k).or_insert(v); }
+                    for (k, v) in shape_id_map  { store.trip_shape_ids.entry(k).or_insert(v); }
+                    for (k, v) in service_id_map{ store.trip_service_ids.entry(k).or_insert(v); }
+                    for (k, v) in direction_map { store.trip_direction_ids.entry(k).or_insert(v); }
+                    for (k, v) in headsign_map  { store.trip_headsigns.entry(k).or_insert(v); }
+                    for (k, v) in block_id_map  { store.trip_block_ids.entry(k).or_insert(v); }
                     0
                 }
                 Err(e) => { eprintln!("parse_trips: {}", e); -1 }
@@ -782,14 +1116,21 @@ fn feed_file_into(store: &mut GtfsStaticStore, fname: &str, slice: &[u8]) -> i32
         },
 
         "stop_times.txt" => {
+            // Parse trip time windows (for is_trip_active fast pre-filter).
             match parse_stop_times(&decompressed) {
                 Ok(map) => { store.trip_windows.extend(map); }
                 Err(e)  => { eprintln!("parse_stop_times: {}", e); return -1; }
             }
+            // Parse stop sequences (for shape interpolation).
             let stop_latlon = store.stop_latlon.clone();
             match parse_stop_sequences(&decompressed, &stop_latlon) {
-                Ok(map) => { store.trip_stop_seqs.extend(map); 0 }
-                Err(e)  => { eprintln!("parse_stop_sequences: {}", e); -1 }
+                Ok(map) => { store.trip_stop_seqs.extend(map); }
+                Err(e)  => { eprintln!("parse_stop_sequences: {}", e); return -1; }
+            }
+            // Parse pickup/dropoff types so non-revenue stops can be flagged.
+            match parse_stop_pickup_types(&decompressed) {
+                Ok(map) => { store.stop_pickup_types.extend(map); 0 }
+                Err(e)  => { eprintln!("parse_stop_pickup_types: {}", e); 0 } // non-fatal
             }
         },
 
@@ -798,7 +1139,19 @@ fn feed_file_into(store: &mut GtfsStaticStore, fname: &str, slice: &[u8]) -> i32
             Err(e)  => { eprintln!("parse_shapes: {}", e); -1 }
         },
 
-        _ => -1,
+        "calendar.txt" => match parse_calendar(&decompressed) {
+            Ok(map) => { store.calendar.extend(map); 0 }
+            Err(e)  => { eprintln!("parse_calendar: {}", e); -1 }
+        },
+
+        "calendar_dates.txt" => match parse_calendar_dates(&decompressed) {
+            Ok(map) => { store.calendar_dates.extend(map); 0 }
+            Err(e)  => { eprintln!("parse_calendar_dates: {}", e); -1 }
+        },
+
+        // Any other file in the ZIP (agency.txt, fare_rules.txt, etc.) is
+        // silently ignored.  Return 0, not -1, to avoid spurious Swift errors.
+        _ => 0,
     }
 }
 
@@ -875,7 +1228,7 @@ fn make_static_result(found: Option<(String, String)>) -> *mut GTFSStaticResult 
 
 /// Allocate a new GTFS static store.
 /// Returns a non-zero `store_id`; free with `gtfs_static_store_free`.
-/// The store starts with `ShortName` strategy (Amtrak-compatible).
+/// The store defaults to `TripShortName` strategy.
 /// Call `gtfs_static_store_set_strategy` before feeding files to change it.
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_new() -> u32 {
@@ -894,10 +1247,10 @@ pub extern "C" fn gtfs_static_store_free(store_id: u32) {
 /// **Call before feeding any files.**
 ///
 /// `strategy` values:
-///   0 = ShortName      (Amtrak / Gold Runner — default)
-///   1 = SeptaTripId    (SEPTA Regional Rail)
-///   2 = RouteShortName (NJT, MBTA, etc.)
-///   3 = Opaque         (trip_id verbatim)
+///   0 = TripShortName      — use `trip_short_name` field (default)
+///   1 = TripIdNumericSuffix — strip leading alpha prefix from first `_`-split token of `trip_id`
+///   2 = RouteShortName     — use `route_short_name` field
+///   3 = TripIdVerbatim     — use `trip_id` as-is
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_set_strategy(store_id: u32, strategy: i32) {
     let mut reg = registry().lock().unwrap();
@@ -977,12 +1330,12 @@ pub extern "C" fn gtfs_static_store_is_loaded(store_id: u32) -> i32 {
     reg.get(store_id).map(|s| if s.is_loaded() { 1 } else { 0 }).unwrap_or(0)
 }
 
-/// Returns 1 if `trip_id` is scheduled as active at `now_eastern` in `store_id`.
+/// Returns 1 if `trip_id` is scheduled as active at `now_local` in `store_id`.
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_is_trip_active(
     store_id:    u32,
     trip_id:     *const c_char,
-    now_eastern: i64,
+    now_local: i64,
 ) -> i32 {
     if store_id == 0 || trip_id.is_null() { return 0; }
     let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } {
@@ -992,16 +1345,16 @@ pub extern "C" fn gtfs_static_store_is_trip_active(
     let reg = registry().lock().unwrap();
     let Some(store) = reg.get(store_id) else { return 0 };
     if store.trip_windows.is_empty() { return 1; }
-    if store.is_trip_active(tid, now_eastern) { 1 } else { 0 }
+    if store.is_trip_active(tid, now_local) { 1 } else { 0 }
 }
 
-/// Compute a smooth interpolated position for `trip_id` at `now_eastern` in `store_id`.
+/// Compute a smooth interpolated position for `trip_id` at `now_local` in `store_id`.
 /// `is_valid = 0` means shape data is unavailable — fall back to raw GPS.
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_interpolate(
     store_id:    u32,
     trip_id:     *const c_char,
-    now_eastern: i64,
+    now_local: i64,
 ) -> InterpolatedPosition {
     let null = InterpolatedPosition { lat: 0.0, lon: 0.0, is_valid: 0 };
     if store_id == 0 || trip_id.is_null() { return null; }
@@ -1011,7 +1364,7 @@ pub extern "C" fn gtfs_static_store_interpolate(
     };
     let mut reg = registry().lock().unwrap();
     let Some(store) = reg.get_mut(store_id) else { return null };
-    match store.interpolate_position(tid, now_eastern) {
+    match store.interpolate_position(tid, now_local) {
         Some((lat, lon)) => InterpolatedPosition { lat, lon, is_valid: 1 },
         None             => null,
     }
@@ -1035,7 +1388,7 @@ pub extern "C" fn gtfs_static_store_reset(store_id: u32) {
 // MARK: - Legacy singleton FFI  (routes to LEGACY_STORE_ID = 1, zero Swift changes needed)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Feed the ZIP tail bytes into the legacy (Amtrak) store.
+/// Feed the ZIP tail bytes into the legacy store.
 #[no_mangle]
 pub extern "C" fn gtfs_static_feed_eocd(
     data: *const u8, data_len: usize, out_count: *mut usize,
@@ -1043,7 +1396,7 @@ pub extern "C" fn gtfs_static_feed_eocd(
     gtfs_static_store_feed_eocd(LEGACY_STORE_ID, data, data_len, out_count)
 }
 
-/// Feed one GTFS file into the legacy (Amtrak) store.
+/// Feed one GTFS file into the legacy store.
 #[no_mangle]
 pub extern "C" fn gtfs_static_feed_file(
     filename: *const c_char, data: *const u8, data_len: usize,
@@ -1051,7 +1404,7 @@ pub extern "C" fn gtfs_static_feed_file(
     gtfs_static_store_feed_file(LEGACY_STORE_ID, filename, data, data_len)
 }
 
-/// Look up a trip_id in the legacy (Amtrak) store.
+/// Look up a trip_id in the legacy store.
 #[no_mangle]
 pub extern "C" fn gtfs_static_lookup(trip_id: *const c_char) -> *mut GTFSStaticResult {
     gtfs_static_store_lookup(LEGACY_STORE_ID, trip_id)
@@ -1088,16 +1441,16 @@ pub extern "C" fn gtfs_static_is_loaded() -> i32 {
     gtfs_static_store_is_loaded(LEGACY_STORE_ID)
 }
 
-/// Returns 1 if `trip_id` is active at `now_eastern` in the legacy store.
+/// Returns 1 if `trip_id` is active at `now_local` in the legacy store.
 #[no_mangle]
-pub extern "C" fn gtfs_static_is_trip_active(trip_id: *const c_char, now_eastern: i64) -> i32 {
-    gtfs_static_store_is_trip_active(LEGACY_STORE_ID, trip_id, now_eastern)
+pub extern "C" fn gtfs_static_is_trip_active(trip_id: *const c_char, now_local: i64) -> i32 {
+    gtfs_static_store_is_trip_active(LEGACY_STORE_ID, trip_id, now_local)
 }
 
 /// Compute an interpolated position from the legacy store.
 #[no_mangle]
-pub extern "C" fn gtfs_interpolate_position(trip_id: *const c_char, now_eastern: i64) -> InterpolatedPosition {
-    gtfs_static_store_interpolate(LEGACY_STORE_ID, trip_id, now_eastern)
+pub extern "C" fn gtfs_interpolate_position(trip_id: *const c_char, now_local: i64) -> InterpolatedPosition {
+    gtfs_static_store_interpolate(LEGACY_STORE_ID, trip_id, now_local)
 }
 
 /// Returns 1 when shape interpolation data is ready in the legacy store.
@@ -1110,4 +1463,139 @@ pub extern "C" fn gtfs_interpolation_is_ready() -> i32 {
 #[no_mangle]
 pub extern "C" fn gtfs_static_reset() {
     gtfs_static_store_reset(LEGACY_STORE_ID)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARK: - Trip metadata FFI (multi-store; legacy wrappers below)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Convert an `Option<&String>` into a heap-allocated `*const c_char`.
+/// Returns `null` when `val` is `None`.
+/// The caller must free the returned pointer with `CString::from_raw` /
+/// `free_rust_string` when it is no longer needed.
+///
+/// Eliminates the repeated
+/// `match val { Some(s) => CString::new(s.as_str()).map(…).unwrap_or(null()), None => null() }`
+/// pattern that appears in every string-returning metadata FFI function.
+#[inline]
+fn optional_str_to_cstr(val: Option<&String>) -> *const c_char {
+    match val {
+        Some(s) => CString::new(s.as_str())
+            .map(|c| c.into_raw() as *const c_char)
+            .unwrap_or(std::ptr::null()),
+        None => std::ptr::null(),
+    }
+}
+
+/// Returns the direction_id (0 or 1) for `trip_id` in `store_id`.
+/// Returns -1 when direction_id is absent or the trip is unknown.
+#[no_mangle]
+pub extern "C" fn gtfs_static_store_get_direction_id(
+    store_id: u32,
+    trip_id:  *const c_char,
+) -> i32 {
+    if store_id == 0 || trip_id.is_null() { return -1; }
+    let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return -1 };
+    let reg = registry().lock().unwrap();
+    let store = match reg.get(store_id) { Some(s) => s, None => return -1 };
+    // Try canonical trip_id, then last segment of mangled RT id.
+    let dir = store.trip_direction_ids.get(tid)
+        .or_else(|| {
+            if tid.contains('_') { tid.split('_').last().and_then(|last| store.trip_direction_ids.get(last)) }
+            else { None }
+        });
+    dir.map(|&d| if d == u8::MAX { -1 } else { d as i32 }).unwrap_or(-1)
+}
+
+/// Returns a heap-allocated C string with the trip_headsign for `trip_id`.
+/// Returns NULL when not available.  Free with `free_rust_string`.
+#[no_mangle]
+pub extern "C" fn gtfs_static_store_get_headsign(
+    store_id: u32,
+    trip_id:  *const c_char,
+) -> *const c_char {
+    if store_id == 0 || trip_id.is_null() { return std::ptr::null(); }
+    let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return std::ptr::null() };
+    let reg = registry().lock().unwrap();
+    let store = match reg.get(store_id) { Some(s) => s, None => return std::ptr::null() };
+    let hs = store.trip_headsigns.get(tid)
+        .or_else(|| {
+            if tid.contains('_') { tid.split('_').last().and_then(|last| store.trip_headsigns.get(last)) }
+            else { None }
+        });
+    optional_str_to_cstr(hs)
+}
+
+/// Returns a heap-allocated C string with the service_id for `trip_id`.
+/// Returns NULL when not available.  Free with `free_rust_string`.
+#[no_mangle]
+pub extern "C" fn gtfs_static_store_get_service_id(
+    store_id: u32,
+    trip_id:  *const c_char,
+) -> *const c_char {
+    if store_id == 0 || trip_id.is_null() { return std::ptr::null(); }
+    let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return std::ptr::null() };
+    let reg = registry().lock().unwrap();
+    let store = match reg.get(store_id) { Some(s) => s, None => return std::ptr::null() };
+    let sid = store.trip_service_ids.get(tid)
+        .or_else(|| {
+            if tid.contains('_') { tid.split('_').last().and_then(|last| store.trip_service_ids.get(last)) }
+            else { None }
+        });
+    optional_str_to_cstr(sid)
+}
+
+/// Returns 1 if calendar.txt or calendar_dates.txt data has been loaded for `store_id`.
+/// Returns 0 when the store has no service-day data (is_trip_active will pass-through).
+#[no_mangle]
+pub extern "C" fn gtfs_static_store_calendar_loaded(store_id: u32) -> i32 {
+    let reg = registry().lock().unwrap();
+    reg.get(store_id)
+        .map(|s| if !s.calendar.is_empty() || !s.calendar_dates.is_empty() { 1 } else { 0 })
+        .unwrap_or(0)
+}
+
+/// Returns 1 if the stop at `(trip_id, stop_sequence)` accepts revenue passengers
+/// (pickup_type == 0 AND dropoff_type == 0).  Returns 1 for any unknown stops
+/// (default assumption: revenue stop).  Use this to filter non-revenue timing
+/// points from next-stop results.
+#[no_mangle]
+pub extern "C" fn gtfs_static_store_is_stop_revenue(
+    store_id:      u32,
+    trip_id:       *const c_char,
+    stop_sequence: u32,
+) -> i32 {
+    if store_id == 0 || trip_id.is_null() { return 1; }
+    let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return 1 };
+    let reg = registry().lock().unwrap();
+    let store = match reg.get(store_id) { Some(s) => s, None => return 1 };
+    match store.stop_pickup_types.get(&(tid.to_string(), stop_sequence)) {
+        // pickup_type=1 AND dropoff_type=1 means no service (timing point / deadhead).
+        Some(&(1, 1)) => 0,
+        // Any entry exists but is not both 1 → partial service still counts as revenue.
+        Some(_) => 1,
+        // Not in map → default (all zeros → regular service).
+        None    => 1,
+    }
+}
+
+// ── Legacy wrappers for the new metadata functions ────────────────────────────
+
+/// Returns the direction_id for `trip_id` in the legacy store.
+/// Returns -1 when absent.
+#[no_mangle]
+pub extern "C" fn gtfs_static_get_direction_id(trip_id: *const c_char) -> i32 {
+    gtfs_static_store_get_direction_id(LEGACY_STORE_ID, trip_id)
+}
+
+/// Returns the trip_headsign for `trip_id` in the legacy store.  Free with `free_rust_string`.
+#[no_mangle]
+pub extern "C" fn gtfs_static_get_headsign(trip_id: *const c_char) -> *const c_char {
+    gtfs_static_store_get_headsign(LEGACY_STORE_ID, trip_id)
+}
+
+/// Returns 1 if calendar data is loaded in the legacy store.
+#[no_mangle]
+pub extern "C" fn gtfs_static_calendar_loaded() -> i32 {
+    gtfs_static_store_calendar_loaded(LEGACY_STORE_ID)
 }

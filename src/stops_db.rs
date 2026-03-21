@@ -27,12 +27,27 @@ use crate::geo::haversine_m;
 /// memory footprint on immutable data.
 #[derive(Debug, Clone)]
 pub struct GTFSStop {
-    pub id:        Box<str>,
-    pub name:      Box<str>,
-    pub url:       Option<Box<str>>,
-    pub lat:       f64,
-    pub lon:       f64,
-    pub providers: Vec<Box<str>>,
+    pub id:            Box<str>,
+    pub name:          Box<str>,
+    pub url:           Option<Box<str>>,
+    pub lat:           f64,
+    pub lon:           f64,
+    pub providers:     Vec<Box<str>>,
+    /// stop_code: public-facing identifier shown on signs and timetables.
+    /// Distinct from stop_id (internal database key).  May be empty.
+    pub code:          Option<Box<str>>,
+    /// location_type:
+    ///   0 (or absent) = routable stop / platform — the only type passengers board at.
+    ///   1 = station (parent of stops)
+    ///   2 = entrance / exit
+    ///   3 = generic node (path waypoint)
+    ///   4 = boarding area
+    /// Best practice: only show location_type=0 stops to passengers.
+    pub location_type: u8,
+    /// stop_timezone: IANA timezone name override for this stop.
+    /// When set, it overrides the agency timezone for local time display.
+    /// Relevant for routes that cross timezone boundaries (e.g. Amtrak long-distance).
+    pub timezone:      Option<Box<str>>,
 }
 
 impl GTFSStop {
@@ -42,23 +57,39 @@ impl GTFSStop {
             && self.lon >= -180.0 && self.lon <= 180.0
     }
 
+    /// Returns true for stops that passengers can actually board at.
+    /// Per GTFS spec and best practices, only location_type=0 (or absent)
+    /// stops are routable boarding points.  Stations (1), entrances (2),
+    /// generic nodes (3), and boarding areas (4) should not appear as
+    /// "next stop" candidates or in spatial passenger-facing queries.
+    #[inline(always)]
+    pub fn is_boardable(&self) -> bool {
+        self.location_type == 0
+    }
+
     pub fn new(
-        id:        String,
-        name:      String,
-        url:       Option<String>,
-        lat:       f64,
-        lon:       f64,
-        providers: Vec<String>,
+        id:            String,
+        name:          String,
+        url:           Option<String>,
+        lat:           f64,
+        lon:           f64,
+        providers:     Vec<String>,
+        code:          Option<String>,
+        location_type: u8,
+        timezone:      Option<String>,
     ) -> Result<Self, &'static str> {
         if lat < -90.0 || lat > 90.0  { return Err("Invalid latitude");  }
         if lon < -180.0 || lon > 180.0 { return Err("Invalid longitude"); }
         Ok(Self {
-            id:        id.into_boxed_str(),
-            name:      name.into_boxed_str(),
-            url:       url.map(|s| s.into_boxed_str()),
+            id:            id.into_boxed_str(),
+            name:          name.into_boxed_str(),
+            url:           url.map(|s| s.into_boxed_str()),
             lat,
             lon,
-            providers: providers.into_iter().map(|s| s.into_boxed_str()).collect(),
+            providers:     providers.into_iter().map(|s| s.into_boxed_str()).collect(),
+            code:          code.filter(|s| !s.is_empty()).map(|s| s.into_boxed_str()),
+            location_type,
+            timezone:      timezone.filter(|s| !s.is_empty()).map(|s| s.into_boxed_str()),
         })
     }
 }
@@ -198,9 +229,13 @@ fn parse_stops_csv(path: &str) -> Result<Vec<GTFSStop>, String> {
     let name_idx = col_index(&headers, "stop_name") .ok_or("YonderCore: Missing stop_name column")?;
     let lat_idx  = col_index(&headers, "stop_lat")  .ok_or("YonderCore: Missing stop_lat column")?;
     let lon_idx  = col_index(&headers, "stop_lon")  .ok_or("YonderCore: Missing stop_lon column")?;
-    let url_idx       = col_index(&headers, "stop_url");
-    let providers_idx = col_index(&headers, "providers");
-    let agency_idx    = col_index(&headers, "agency_id");
+    let url_idx           = col_index(&headers, "stop_url");
+    let providers_idx     = col_index(&headers, "providers");
+    let agency_idx        = col_index(&headers, "agency_id");
+    // New GTFS columns
+    let code_idx          = col_index(&headers, "stop_code");
+    let location_type_idx = col_index(&headers, "location_type");
+    let timezone_idx      = col_index(&headers, "stop_timezone");
 
     let mut stops = Vec::with_capacity(10_000);
     let mut line_num = 1usize;
@@ -230,21 +265,34 @@ fn parse_stops_csv(path: &str) -> Result<Vec<GTFSStop>, String> {
 
         if lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0 { continue; }
 
-        let url = url_idx.and_then(|i| record.get(i)).and_then(|s| {
-            let t = s.trim(); if t.is_empty() { None } else { Some(t.to_string()) }
-        });
+        let url = url_idx.and_then(|i| record.get(i)).and_then(|s| nonempty_str(s));
 
         let providers: Vec<String> = if let Some(i) = providers_idx {
             record.get(i).map(parse_providers).unwrap_or_default()
         } else if let Some(i) = agency_idx {
-            record.get(i).and_then(|s| {
-                let t = s.trim(); if t.is_empty() { None } else { Some(parse_providers(t)) }
-            }).unwrap_or_default()
+            record.get(i).and_then(|s| nonempty_str(s).map(|t| parse_providers(&t)))
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
 
-        if let Ok(stop) = GTFSStop::new(id.to_string(), name.to_string(), url, lat, lon, providers) {
+        // stop_code: public-facing stop identifier (shown on signs/apps).
+        let code = code_idx.and_then(|i| record.get(i)).and_then(|s| nonempty_str(s));
+
+        // location_type: 0=stop, 1=station, 2=entrance, 3=node, 4=boarding area.
+        // Default to 0 (routable stop) when absent, per GTFS spec.
+        let location_type: u8 = location_type_idx
+            .and_then(|i| record.get(i))
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            .unwrap_or(0);
+
+        // stop_timezone: IANA timezone override (e.g. "America/Chicago").
+        let timezone = timezone_idx.and_then(|i| record.get(i)).and_then(|s| nonempty_str(s));
+
+        if let Ok(stop) = GTFSStop::new(
+            id.to_string(), name.to_string(), url, lat, lon, providers,
+            code, location_type, timezone,
+        ) {
             stops.push(stop);
         }
     }
@@ -258,6 +306,14 @@ fn parse_providers(input: &str) -> Vec<String> {
     input.split(',')
         .filter_map(|p| { let t = p.trim(); if t.is_empty() { None } else { Some(t.to_string()) } })
         .collect()
+}
+
+/// Trim a CSV field and return `Some(owned_string)` when non-empty, `None` otherwise.
+/// Eliminates the repeated inline `and_then(|s| { let t = s.trim(); … })` pattern.
+#[inline]
+fn nonempty_str(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
 }
 
 /// Case-insensitive column index lookup.
@@ -281,7 +337,12 @@ pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
 }
 
 /// Serialize a slice of `GTFSStop` into a heap-allocated `char**` array.
-/// Each element is a pipe-delimited string: `id|name|lat|lon|url|providers`.
+/// Each element is a pipe-delimited string:
+///   `id|name|lat|lon|url|providers|stop_code|location_type|timezone`
+///
+/// Fields 7–9 (stop_code, location_type, timezone) are new; existing Swift
+/// parsers that only read fields 1–6 are unaffected.
+///
 /// Returns NULL on allocation failure, cleaning up any already-allocated strings.
 unsafe fn stops_to_c_string_array(
     stops:     &[GTFSStop],
@@ -295,10 +356,14 @@ unsafe fn stops_to_c_string_array(
             .map(|s| s.as_ref())
             .collect::<Vec<&str>>()
             .join(",");
+        let code_str      = stop.code.as_deref().unwrap_or("");
+        let timezone_str  = stop.timezone.as_deref().unwrap_or("");
 
         let formatted = format!(
-            "{}|{}|{}|{}|{}|{}",
-            stop.id, stop.name, stop.lat, stop.lon, url_str, providers_str
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            stop.id, stop.name, stop.lat, stop.lon,
+            url_str, providers_str,
+            code_str, stop.location_type, timezone_str
         );
 
         match CString::new(formatted) {
@@ -463,6 +528,62 @@ pub extern "C" fn stops_db_find_by_provider(
             Ok(stops) => {
                 let matching: Vec<GTFSStop> = stops.into_iter()
                     .filter(|s| s.providers.iter().any(|p| p.as_ref() == prov))
+                    .collect();
+                stops_to_c_string_array(&matching, out_count)
+            }
+            Err(_) => { *out_count = 0; std::ptr::null_mut() }
+        }
+    }
+}
+
+/// Find all stops within `radius_meters` of `(lat, lon)` that are boardable
+/// (location_type == 0).  Filters out station nodes, entrances, and boarding
+/// areas so only actual passenger boarding points are returned.
+/// Free with `stops_db_free_results`.
+#[no_mangle]
+pub extern "C" fn stops_db_find_near_boardable(
+    db:            *const StopsDatabase,
+    lat:           f64,
+    lon:           f64,
+    radius_meters: f64,
+    out_count:     *mut usize,
+) -> *mut *mut c_char {
+    if db.is_null() || out_count.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        let db = &*db;
+        match db.stops_near(lat, lon, radius_meters) {
+            Ok(stops) => {
+                let boardable: Vec<GTFSStop> = stops.into_iter()
+                    .filter(|s| s.is_boardable())
+                    .collect();
+                stops_to_c_string_array(&boardable, out_count)
+            }
+            Err(_) => { *out_count = 0; std::ptr::null_mut() }
+        }
+    }
+}
+
+/// Find a stop by its public-facing `stop_code` (the code shown on signs and
+/// timetables — distinct from the internal `stop_id`).
+/// Returns a `char**` array (may have multiple hits if the same code appears
+/// across different providers).  Free with `stops_db_free_results`.
+#[no_mangle]
+pub extern "C" fn stops_db_find_by_code(
+    db:        *const StopsDatabase,
+    stop_code: *const c_char,
+    out_count: *mut usize,
+) -> *mut *mut c_char {
+    if db.is_null() || stop_code.is_null() || out_count.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe {
+        let Some(code_str) = cstr_to_str(stop_code) else {
+            *out_count = 0; return std::ptr::null_mut();
+        };
+        match (&*db).get_all() {
+            Ok(stops) => {
+                let matching: Vec<GTFSStop> = stops.into_iter()
+                    .filter(|s| s.code.as_deref() == Some(code_str))
                     .collect();
                 stops_to_c_string_array(&matching, out_count)
             }
