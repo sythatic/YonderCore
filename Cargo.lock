@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "yonder_core"
-version = "1.0.3"
+version = "1.1.0"
 dependencies = [
  "csv",
  "flate2",

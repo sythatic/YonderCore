@@ -21,6 +21,8 @@ cargo build --release --target aarch64-apple-ios-sim
 cargo build --release --target x86_64-apple-ios
 cargo build --release --target aarch64-apple-darwin
 cargo build --release --target x86_64-apple-darwin
+#cargo build --release --target aarch64-apple-watchos
+#cargo build --release --target aarch64-apple-watchos-sim
 
 mkdir -p target/ios-simulator
 mkdir -p target/macos-universal

@@ -922,3 +922,157 @@ pub struct TripUpdateSummary {
     /// True if `next_stop_id` and `next_arrival_time` are populated.
     pub has_next_stop: bool,
 }
+
+// ── FFI ───────────────────────────────────────────────────────────────────────
+
+/// Create a new GTFS-RT manager.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_new() -> *mut GtfsRtCore {
+    Box::into_raw(Box::new(GtfsRtCore::new()))
+}
+
+/// Parse a GTFS-RT protobuf blob into `core`, replacing any previously parsed
+/// feed data.  Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_parse(
+    core:     *mut GtfsRtCore,
+    data:     *const u8,
+    data_len: usize,
+) -> i32 {
+    if core.is_null() || data.is_null() { return -1; }
+    unsafe {
+        let data_slice = std::slice::from_raw_parts(data, data_len);
+        match (&*core).parse(data_slice) { Ok(_) => 0, Err(_) => -1 }
+    }
+}
+
+/// Get all vehicles from the most recently parsed feed.
+/// Sets `*out_count`.  Free with `gtfs_rt_free_vehicles`.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_get_vehicles(
+    core:      *const GtfsRtCore,
+    out_count: *mut usize,
+) -> *mut FFIVehicle {
+    if core.is_null() || out_count.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        let vehicles = match (&*core).get_vehicles() {
+            Ok(v)  => v,
+            Err(_) => { *out_count = 0; return std::ptr::null_mut(); }
+        };
+        *out_count = vehicles.len();
+        if vehicles.is_empty() { return std::ptr::null_mut(); }
+        Box::into_raw(vehicles.into_boxed_slice()) as *mut FFIVehicle
+    }
+}
+
+/// Number of vehicles in the most recently parsed feed.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_vehicle_count(core: *const GtfsRtCore) -> usize {
+    if core.is_null() { return 0; }
+    unsafe { (&*core).vehicle_count().unwrap_or(0) }
+}
+
+/// Free a vehicle array returned by `gtfs_rt_get_vehicles`.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_free_vehicles(vehicles: *mut FFIVehicle, count: usize) {
+    if vehicles.is_null() || count == 0 { return; }
+    unsafe {
+        let slice = std::slice::from_raw_parts_mut(vehicles, count);
+        for v in slice.iter() {
+            if !v.id.is_null()       { let _ = CString::from_raw(v.id as *mut c_char); }
+            if !v.route_id.is_null() { let _ = CString::from_raw(v.route_id as *mut c_char); }
+            if !v.trip_id.is_null()  { let _ = CString::from_raw(v.trip_id as *mut c_char); }
+            if !v.label.is_null()    { let _ = CString::from_raw(v.label as *mut c_char); }
+        }
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(vehicles, count)));
+    }
+}
+
+/// Free a `GtfsRtCore` allocated by `gtfs_rt_new`.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_free(core: *mut GtfsRtCore) {
+    if !core.is_null() { unsafe { let _ = Box::from_raw(core); } }
+}
+
+/// Look up trip-update data for `trip_id`.
+/// Returns a heap-allocated `TripUpdateSummary`, or NULL if not found.
+/// Free with `gtfs_rt_free_trip_update`.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_get_trip_update(
+    core:    *const GtfsRtCore,
+    trip_id: *const c_char,
+) -> *mut TripUpdateSummary {
+    if core.is_null() || trip_id.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        let trip_id_str = match CStr::from_ptr(trip_id).to_str() {
+            Ok(s)  => s,
+            Err(_) => return std::ptr::null_mut(),
+        };
+        match (&*core).get_trip_update(trip_id_str) {
+            Ok(Some(summary)) => Box::into_raw(Box::new(summary)),
+            _                 => std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Free a `TripUpdateSummary` returned by `gtfs_rt_get_trip_update`.
+/// Also frees the heap-allocated `next_stop_id` C string inside the struct.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_free_trip_update(summary: *mut TripUpdateSummary) {
+    if summary.is_null() { return; }
+    unsafe {
+        let s = &*summary;
+        if !s.next_stop_id.is_null() {
+            let _ = CString::from_raw(s.next_stop_id as *mut c_char);
+        }
+        let _ = Box::from_raw(summary);
+    }
+}
+
+/// Return all vehicles enriched with TripUpdate data in a single FFI call,
+/// replacing the previous N×`gtfs_static_is_trip_active` + N×`gtfs_rt_get_trip_update`
+/// pattern.
+///
+/// `now_eastern` is retained for API compatibility but is no longer used to
+/// gate vehicles — the RT feed is the authoritative source of what is moving.
+///
+/// Free with `gtfs_rt_free_enriched_vehicles`.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_get_active_enriched_vehicles(
+    core:        *const GtfsRtCore,
+    now_eastern: i64,
+    out_count:   *mut usize,
+) -> *mut FFIEnrichedVehicle {
+    if core.is_null() || out_count.is_null() { return std::ptr::null_mut(); }
+    unsafe {
+        let vehicles = match (&*core).get_active_enriched_vehicles(now_eastern) {
+            Ok(v)  => v,
+            Err(_) => { *out_count = 0; return std::ptr::null_mut(); }
+        };
+        *out_count = vehicles.len();
+        if vehicles.is_empty() { return std::ptr::null_mut(); }
+        Box::into_raw(vehicles.into_boxed_slice()) as *mut FFIEnrichedVehicle
+    }
+}
+
+/// Free an array returned by `gtfs_rt_get_active_enriched_vehicles`.
+/// Frees every heap-allocated C string field (id, route_id, trip_id, label,
+/// next_stop_id) before dropping the slice.
+#[no_mangle]
+pub extern "C" fn gtfs_rt_free_enriched_vehicles(
+    vehicles: *mut FFIEnrichedVehicle,
+    count:    usize,
+) {
+    if vehicles.is_null() || count == 0 { return; }
+    unsafe {
+        let slice = std::slice::from_raw_parts(vehicles, count);
+        for v in slice.iter() {
+            if !v.id.is_null()          { let _ = CString::from_raw(v.id as *mut c_char); }
+            if !v.route_id.is_null()    { let _ = CString::from_raw(v.route_id as *mut c_char); }
+            if !v.trip_id.is_null()     { let _ = CString::from_raw(v.trip_id as *mut c_char); }
+            if !v.label.is_null()       { let _ = CString::from_raw(v.label as *mut c_char); }
+            if !v.next_stop_id.is_null(){ let _ = CString::from_raw(v.next_stop_id as *mut c_char); }
+        }
+        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(vehicles, count)));
+    }
+}
