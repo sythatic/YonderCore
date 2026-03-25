@@ -933,33 +933,53 @@ impl GtfsRtManager {
 
         // 1. Staleness check.
         //
-        //    VehiclePosition.timestamp is optional per the GTFS-RT spec. When
-        //    absent the field is unset (prost decodes this as None). Applying
-        //    unwrap_or(0) and then checking age > 0 would silently drop every
-        //    vehicle without a timestamp.
+        //    VehiclePosition.timestamp is optional per the GTFS-RT spec.
+        //    Spec guidance: "If not present, use the timestamp from the feed header."
         //
-        //    Spec guidance: "If not present, use the timestamp from the feed
-        //    header." We do exactly that, but we only apply the 4-hour staleness
-        //    guard when the timestamp is vehicle-specific. When we fall back to
-        //    the header timestamp we know the *feed* is fresh; we just can't say
-        //    how old this particular GPS fix is, so we let it through.
+        //    We always apply the staleness check. When the vehicle has no
+        //    per-vehicle timestamp we use the feed header timestamp as the
+        //    best available proxy — if the feed header is also fresh we know
+        //    the *feed* is live, but we still don't want to show vehicles
+        //    that were last reported many hours ago with no update.
+        //
+        //    Threshold: 90 minutes. Amtrak's feed updates every 30–60 s for
+        //    active trains. A vehicle absent for 90+ minutes has completed its
+        //    trip or is off-service. The previous 4-hour window was too wide —
+        //    Amtrak retains completed-trip entities for hours, and vehicles
+        //    with no per-vehicle timestamp (common in the Amtrak feed) were
+        //    bypassing the check entirely, inflating counts to ~310 vs ~49.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let (ts, apply_staleness_check) = match vehicle.timestamp {
-            Some(t) if t > 0 => (t, true),
-            _ => (feed_header_ts, false),
+        // Prefer per-vehicle timestamp; fall back to feed header.
+        let ts = match vehicle.timestamp {
+            Some(t) if t > 0 => t,
+            _ => feed_header_ts,
         };
 
-        // If we have no timestamp at all (even the header is missing/zero),
-        // the position is unverifiable — drop it.
+        // No timestamp at all — position is unverifiable.
         if ts == 0 {
             return None;
         }
 
-        if apply_staleness_check && now.saturating_sub(ts) > 4 * 60 * 60 {
+        // Reject future-timestamped vehicles.
+        //
+        // Amtrak populates VehiclePosition.timestamp with the scheduled next
+        // departure time for trains that haven't departed yet — not the GPS
+        // observation time. 262 of 323 feed entities currently have timestamps
+        // minutes-to-hours in the future; these are pre-departure schedule
+        // entries with no real GPS fix, and must be suppressed.
+        //
+        // A small tolerance of 60 s is allowed for clock skew between the
+        // feed server and the device.
+        if ts > now + 60 {
+            return None;
+        }
+
+        // 90-minute staleness gate for genuinely past timestamps.
+        if now.saturating_sub(ts) > 90 * 60 {
             return None;
         }
 
