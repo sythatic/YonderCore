@@ -86,9 +86,19 @@ char** stops_db_find_by_code(
 char** stops_db_find_by_provider(
     const StopsDatabase* db, const char* provider, size_t* out_count);
 
-void   stops_db_free_results(char** results, size_t count);
-size_t stops_db_count(const StopsDatabase* db);
-void   stops_db_free(StopsDatabase* db);
+void    stops_db_free_results(char** results, size_t count);
+size_t  stops_db_count(const StopsDatabase* db);
+
+/// Remove all stops from `db`, resetting it to an empty state.
+/// Useful before re-loading stops from a fresh CSV. Returns 0 on success, -1 on error.
+int32_t stops_db_clear(StopsDatabase* db);
+
+/// Rebuild the R-tree spatial index using bulk_load for optimal balanced-tree
+/// query performance. Call once after all feeds are loaded via repeated
+/// stops_db_load_csv calls. Returns 0 on success, -1 on error.
+int32_t stops_db_rebuild_index(StopsDatabase* db);
+
+void    stops_db_free(StopsDatabase* db);
 
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -168,6 +178,7 @@ int32_t tile_cache_is_negative(const TileCacheCore* cache, const char* cache_key
 #define GTFS_RT_CAUSE_MEDICAL_EMERGENCY  11
 
 // ── Alert Effect values ───────────────────────────────────────────────────────
+#define GTFS_RT_EFFECT_NOT_PROVIDED        0  ///< effect field absent in feed
 #define GTFS_RT_EFFECT_NO_SERVICE          1
 #define GTFS_RT_EFFECT_REDUCED_SERVICE     2
 #define GTFS_RT_EFFECT_SIGNIFICANT_DELAYS  3
@@ -337,6 +348,7 @@ int32_t           gtfs_static_is_trip_active(const char* trip_id, int64_t now_lo
 InterpolatedPosition gtfs_interpolate_position(const char* trip_id, int64_t now_local);
 int32_t              gtfs_interpolation_is_ready(void);
 void                 gtfs_static_reset(void);
+
 
 int32_t     gtfs_static_get_direction_id(const char* trip_id);
 const char* gtfs_static_get_headsign(const char* trip_id);   ///< free with free_rust_string

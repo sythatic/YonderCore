@@ -17,5 +17,9 @@ pub(crate) fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let dlon = (lon2 - lon1) * D;
     let a = (dlat * 0.5).sin().powi(2)
         + (lat1 * D).cos() * (lat2 * D).cos() * (dlon * 0.5).sin().powi(2);
-    R * 2.0 * a.sqrt().asin()
+    // Clamp to [0, 1] to prevent NaN from floating-point rounding at antipodal points
+    // where `a` can exceed 1.0 by a tiny epsilon (upper bound) or go slightly
+    // negative due to floating-point cancellation (lower bound), both of which
+    // make sqrt / asin return NaN.
+    R * 2.0 * a.clamp(0.0, 1.0).sqrt().asin()
 }

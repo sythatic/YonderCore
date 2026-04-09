@@ -3,7 +3,6 @@
 set -e
 
 cargo clean
-rm -f Cargo.lock
 
 mkdir -p target/headers
 cp YonderCore.h target/headers/

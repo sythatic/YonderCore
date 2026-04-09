@@ -529,38 +529,21 @@ pub struct FFIVehicle {
     pub start_time: *const c_char,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct FFITripUpdate {
-    pub trip_id: *const c_char,
-    pub route_id: *const c_char,
-    pub vehicle_id: *const c_char,
-    pub timestamp: i64,
-    pub delay: i32,
-    pub has_delay: bool,
-    pub stop_time_updates_count: usize,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct FFIStopTimeUpdate {
-    pub stop_id: *const c_char,
-    pub stop_sequence: u32,
-    pub arrival_delay: i32,
-    pub arrival_time: i64,
-    pub departure_delay: i32,
-    pub departure_time: i64,
-    pub has_arrival: bool,
-    pub has_departure: bool,
-}
-
 // MARK: - GTFS-RT Manager
 
 pub struct GtfsRtManager {
     vehicles: Vec<VehiclePosition>,
     trip_updates: Vec<TripUpdate>,
+    /// O(1) index from trip_id → index in `trip_updates`.
+    /// Rebuilt on every `parse_feed`; kept in sync so `find_trip_update` is O(1)
+    /// rather than O(n) per vehicle during enrichment.
+    trip_id_index: std::collections::HashMap<String, usize>,
     alerts: Vec<Alert>,
     last_update: Option<u64>,
+}
+
+impl Default for GtfsRtManager {
+    fn default() -> Self { Self::new() }
 }
 
 impl GtfsRtManager {
@@ -568,6 +551,7 @@ impl GtfsRtManager {
         Self {
             vehicles: Vec::new(),
             trip_updates: Vec::new(),
+            trip_id_index: std::collections::HashMap::new(),
             alerts: Vec::new(),
             last_update: None,
         }
@@ -580,6 +564,7 @@ impl GtfsRtManager {
 
         self.vehicles.clear();
         self.trip_updates.clear();
+        self.trip_id_index.clear();
         self.alerts.clear();
         self.last_update = feed.header.timestamp;
 
@@ -649,13 +634,18 @@ impl GtfsRtManager {
                 if let Some(tid) = tid {
                     let new_ts = trip_update.timestamp.unwrap_or(0);
                     if let Some(&existing_idx) = seen_trip_ids.get(&tid) {
+                        // In-place replacement: the slot index recorded in
+                        // `trip_id_index` still points to `existing_idx` and
+                        // remains correct after overwriting the value at that
+                        // position.  `trip_id_index` does NOT need updating here.
                         let existing_ts = self.trip_updates[existing_idx].timestamp.unwrap_or(0);
                         if new_ts > existing_ts {
                             self.trip_updates[existing_idx] = trip_update;
                         }
                     } else {
                         let idx = self.trip_updates.len();
-                        seen_trip_ids.insert(tid, idx);
+                        seen_trip_ids.insert(tid.clone(), idx);
+                        self.trip_id_index.insert(tid, idx);
                         self.trip_updates.push(trip_update);
                     }
                 } else {
@@ -714,13 +704,8 @@ impl GtfsRtManager {
     }
 
     pub fn find_trip_update(&self, trip_id: &str) -> Option<&TripUpdate> {
-        self.trip_updates.iter().find(|tu| {
-            tu.trip
-                .trip_id
-                .as_ref()
-                .map(|id| id.as_str() == trip_id)
-                .unwrap_or(false)
-        })
+        let idx = *self.trip_id_index.get(trip_id)?;
+        self.trip_updates.get(idx)
     }
 
     /// Internal trip-update extraction used by `GtfsRtCore::get_active_enriched_vehicles`.
@@ -974,7 +959,7 @@ impl GtfsRtManager {
         //
         // A small tolerance of 60 s is allowed for clock skew between the
         // feed server and the device.
-        if ts > now + 60 {
+        if ts > now.saturating_add(60) {
             return None;
         }
 
@@ -1304,7 +1289,7 @@ pub extern "C" fn gtfs_rt_parse(
     data:     *const u8,
     data_len: usize,
 ) -> i32 {
-    if core.is_null() || data.is_null() { return -1; }
+    if core.is_null() || data.is_null() || data_len == 0 { return -1; }
     unsafe {
         let data_slice = std::slice::from_raw_parts(data, data_len);
         match (&*core).parse(data_slice) { Ok(_) => 0, Err(_) => -1 }
@@ -1407,7 +1392,7 @@ pub extern "C" fn gtfs_rt_free_trip_update(summary: *mut TripUpdateSummary) {
 #[no_mangle]
 pub extern "C" fn gtfs_rt_get_active_enriched_vehicles(
     core:        *const GtfsRtCore,
-    now_local: i64,
+    now_local:   i64,
     out_count:   *mut usize,
 ) -> *mut FFIEnrichedVehicle {
     if core.is_null() || out_count.is_null() { return std::ptr::null_mut(); }
@@ -1499,12 +1484,20 @@ fn alert_to_ffi(alert: &Alert) -> FFIAlert {
         .and_then(|s| CString::new(s).ok())
         .map_or(std::ptr::null(), |s| s.into_raw());
 
-    let cause          = alert.cause.unwrap_or(0);
-    let effect         = alert.effect.unwrap_or(0);
+    let cause  = alert.cause.unwrap_or(0);
+    let effect = alert.effect.unwrap_or(0);
+    // The GTFS-RT spec defines SeverityLevel wire values as:
+    //   UNKNOWN_SEVERITY=1, INFO=2, WARNING=3, SEVERE=4
+    // The header constants follow this same numbering (NOT_PROVIDED=0, UNKNOWN=1, …).
+    // prost stores the raw i32 wire value; None means the field was absent (NOT_PROVIDED).
+    // No shift is needed — unwrap_or(0) maps absent → NOT_PROVIDED(0) correctly.
     let severity_level = alert.severity_level.unwrap_or(0);
 
     let (active_period_start, active_period_end) = alert.active_period.first()
-        .map(|ap| (ap.start.unwrap_or(0) as i64, ap.end.unwrap_or(0) as i64))
+        .map(|ap| (
+            ap.start.unwrap_or(0).min(i64::MAX as u64) as i64,
+            ap.end.unwrap_or(0).min(i64::MAX as u64) as i64,
+        ))
         .unwrap_or((0, 0));
 
     let affected_route_ids = pipe_join_unique(

@@ -96,12 +96,19 @@ pub extern "C" fn tile_cache_save(
         } else {
             &[]
         };
-        let meta = if is_negative != 0 {
-            TileMeta::new_negative(expiration_secs)
+        if is_negative != 0 {
+            // Route negative entries through save_negative_cache, which writes
+            // only a .meta sentinel.  Using save_tile here would also create an
+            // empty .tile file, inconsistent with how save_negative_cache works.
+            match cache.save_negative_cache(key_str, expiration_secs) { Ok(_) => 1, Err(_) => 0 }
         } else {
-            TileMeta::new_success(expiration_secs, data_len as u32)
-        };
-        match cache.save_tile(key_str, data_slice, &meta) { Ok(_) => 1, Err(_) => 0 }
+            let data_size = match u32::try_from(data_len) {
+                Ok(n)  => n,
+                Err(_) => return 0, // tile > 4 GiB — refuse
+            };
+            let meta = TileMeta::new_success(expiration_secs, data_size);
+            match cache.save_tile(key_str, data_slice, &meta) { Ok(_) => 1, Err(_) => 0 }
+        }
     }
 }
 
@@ -131,9 +138,11 @@ pub extern "C" fn tile_cache_load(
                 *out_data_len = ct.data.len();
                 if !out_http_status.is_null() { *out_http_status = ct.meta.http_status; }
                 if !out_is_negative.is_null() { *out_is_negative = if ct.meta.is_negative { 1 } else { 0 }; }
-                let mut data = ct.data;
-                let ptr = data.as_mut_ptr();
-                std::mem::forget(data);
+                // Convert to a boxed slice so capacity == length, making the
+                // Vec::from_raw_parts reconstruction in tile_cache_free_data sound.
+                let mut boxed: Box<[u8]> = ct.data.into_boxed_slice();
+                let ptr = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
                 ptr
             }
             None => std::ptr::null_mut(),
@@ -144,8 +153,12 @@ pub extern "C" fn tile_cache_load(
 /// Free tile data returned by `tile_cache_load`.
 #[no_mangle]
 pub extern "C" fn tile_cache_free_data(data: *mut u8, len: usize) {
-    if data.is_null() || len == 0 { return; }
-    unsafe { let _ = Vec::from_raw_parts(data, len, len); }
+    // Do not skip the free when len == 0: a zero-length Box<[u8]> is valid and
+    // must be dropped to avoid leaking its heap allocation metadata.
+    if data.is_null() { return; }
+    // Reconstruct the Box<[u8]> that was forgotten in tile_cache_load.
+    // The pointer originated from Box::into_raw(boxed_slice), so this is safe.
+    unsafe { drop(Box::from_raw(std::slice::from_raw_parts_mut(data, len))); }
 }
 
 /// Remove a single tile from the cache by key.
@@ -173,7 +186,10 @@ pub extern "C" fn tile_cache_is_valid(cache: *const TileCacheCore, cache_key: *c
 #[no_mangle]
 pub extern "C" fn tile_cache_cleanup_expired(cache: *mut TileCacheCore) -> usize {
     if cache.is_null() { return 0; }
-    unsafe { (&*cache).clear_expired().unwrap_or(0) as usize }
+    unsafe {
+        usize::try_from((&*cache).clear_expired().unwrap_or(0))
+            .unwrap_or(usize::MAX)
+    }
 }
 
 /// Total on-disk size of the cache in bytes.

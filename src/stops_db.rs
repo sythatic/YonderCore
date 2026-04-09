@@ -107,6 +107,10 @@ struct StopsDatabaseInner {
     id_index:      HashMap<Box<str>, usize>,
 }
 
+impl Default for StopsDatabase {
+    fn default() -> Self { Self::new() }
+}
+
 impl StopsDatabase {
     pub fn new() -> Self {
         Self {
@@ -120,6 +124,15 @@ impl StopsDatabase {
 
     /// Load stops from a CSV file, **appending** to any already-loaded stops.
     /// Returns the number of newly added stops, or an error string.
+    ///
+    /// # Spatial index note
+    ///
+    /// Each call inserts new stops into the R-tree incrementally.  Incremental
+    /// insertion is O(log N) per stop but produces a less balanced tree than
+    /// `bulk_load`.  When loading multiple CSVs, call
+    /// [`rebuild_spatial_index`][Self::rebuild_spatial_index] once after all
+    /// feeds have been loaded to rebuild an optimally balanced tree in one
+    /// O(N log N) pass.  The FFI counterpart is `stops_db_rebuild_index`.
     pub fn load_from_csv(&self, csv_path: &str) -> Result<usize, String> {
         let new_stops = parse_stops_csv(csv_path)?;
         let count = new_stops.len();
@@ -131,19 +144,33 @@ impl StopsDatabase {
 
         for (i, stop) in new_stops.into_iter().enumerate() {
             let idx = start_idx + i;
+            // Incremental R-tree insert — O(log N) per stop.
+            // Call rebuild_spatial_index() after all feeds are loaded for a
+            // bulk_load-balanced tree if query performance is critical.
+            if stop.has_valid_coordinates() {
+                inner.spatial_index.insert(GeomWithData::new([stop.lon, stop.lat], idx));
+            }
             inner.id_index.insert(stop.id.clone(), idx);
             inner.stops.push(stop);
         }
 
-        // Rebuild the spatial index in bulk — rstar has no incremental insert.
+        Ok(count)
+    }
+
+    /// Rebuild the spatial index using `bulk_load` for an optimally balanced
+    /// R-tree.  Call this once after loading all feeds to amortise the cost of
+    /// incremental insertions done by repeated [`load_from_csv`][Self::load_from_csv]
+    /// calls.
+    pub fn rebuild_spatial_index(&self) -> Result<(), String> {
+        let mut inner = self.inner.write()
+            .map_err(|_| "Failed to acquire write lock")?;
         let all_points: Vec<StopPoint> = inner.stops.iter()
             .enumerate()
             .filter(|(_, s)| s.has_valid_coordinates())
             .map(|(idx, s)| GeomWithData::new([s.lon, s.lat], idx))
             .collect();
         inner.spatial_index = RTree::bulk_load(all_points);
-
-        Ok(count)
+        Ok(())
     }
 
     /// Find all stops within `radius_meters` of `(lat, lon)`.
@@ -196,6 +223,28 @@ impl StopsDatabase {
         let inner = self.inner.read()
             .map_err(|_| "Failed to acquire read lock")?;
         Ok(inner.stops.clone())
+    }
+
+    /// Return only stops whose `providers` list contains `provider`.
+    /// Holds the read lock for the full scan but clones only matching stops.
+    pub fn find_by_provider(&self, provider: &str) -> Result<Vec<GTFSStop>, String> {
+        let inner = self.inner.read()
+            .map_err(|_| "Failed to acquire read lock")?;
+        Ok(inner.stops.iter()
+            .filter(|s| s.providers.iter().any(|p| p.as_ref() == provider))
+            .cloned()
+            .collect())
+    }
+
+    /// Return only stops whose `stop_code` equals `code`.
+    /// Holds the read lock for the full scan but clones only matching stops.
+    pub fn find_by_code(&self, code: &str) -> Result<Vec<GTFSStop>, String> {
+        let inner = self.inner.read()
+            .map_err(|_| "Failed to acquire read lock")?;
+        Ok(inner.stops.iter()
+            .filter(|s| s.code.as_deref() == Some(code))
+            .cloned()
+            .collect())
     }
 
     pub fn count(&self) -> usize {
@@ -348,6 +397,10 @@ unsafe fn stops_to_c_string_array(
     stops:     &[GTFSStop],
     out_count: *mut usize,
 ) -> *mut *mut c_char {
+    if stops.is_empty() {
+        *out_count = 0;
+        return std::ptr::null_mut();
+    }
     let mut result: Vec<*mut c_char> = Vec::with_capacity(stops.len());
 
     for stop in stops {
@@ -376,8 +429,11 @@ unsafe fn stops_to_c_string_array(
     }
 
     *out_count = result.len();
-    let ptr = result.as_mut_ptr();
-    std::mem::forget(result);
+    // Use into_boxed_slice so capacity == length; Vec::from_raw_parts with a
+    // mismatched capacity would be undefined behaviour in the free function.
+    let mut boxed: Box<[*mut c_char]> = result.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
     ptr
 }
 
@@ -397,7 +453,24 @@ pub extern "C" fn stops_db_load_csv(db: *mut StopsDatabase, path: *const c_char)
     unsafe {
         let db = &*db;
         let path_str = match CStr::from_ptr(path).to_str() { Ok(s) => s, Err(_) => return -1 };
-        match db.load_from_csv(path_str) { Ok(n) => n as i32, Err(_) => -1 }
+        match db.load_from_csv(path_str) {
+            Ok(n)  => i32::try_from(n).unwrap_or(i32::MAX),
+            Err(_) => -1,
+        }
+    }
+}
+
+/// Rebuild the spatial R-tree index using `bulk_load` for optimal query
+/// performance.  Call this once after loading all feeds via repeated
+/// `stops_db_load_csv` calls.  Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn stops_db_rebuild_index(db: *mut StopsDatabase) -> i32 {
+    if db.is_null() { return -1; }
+    unsafe {
+        match (&*db).rebuild_spatial_index() {
+            Ok(())  => 0,
+            Err(_)  => -1,
+        }
     }
 }
 
@@ -442,8 +515,9 @@ pub extern "C" fn stops_db_get_all(
 pub extern "C" fn stops_db_free_results(results: *mut *mut c_char, count: usize) {
     if results.is_null() { return; }
     unsafe {
-        let v = Vec::from_raw_parts(results, count, count);
-        for ptr in v { if !ptr.is_null() { let _ = CString::from_raw(ptr); } }
+        // Reconstruct the Box<[*mut c_char]> produced by stops_to_c_string_array.
+        let boxed = Box::from_raw(std::slice::from_raw_parts_mut(results, count));
+        for ptr in boxed.iter() { if !ptr.is_null() { let _ = CString::from_raw(*ptr); } }
     }
 }
 
@@ -452,6 +526,19 @@ pub extern "C" fn stops_db_free_results(results: *mut *mut c_char, count: usize)
 pub extern "C" fn stops_db_count(db: *const StopsDatabase) -> usize {
     if db.is_null() { return 0; }
     unsafe { (&*db).count() }
+}
+
+/// Remove all stops from `db`, resetting it to an empty state.
+/// Returns 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn stops_db_clear(db: *mut StopsDatabase) -> i32 {
+    if db.is_null() { return -1; }
+    unsafe {
+        match (&*db).clear() {
+            Ok(()) => 0,
+            Err(_) => -1,
+        }
+    }
 }
 
 /// Find the single nearest stop using the R-tree (O(log n)).
@@ -524,14 +611,9 @@ pub extern "C" fn stops_db_find_by_provider(
         let Some(prov) = cstr_to_str(provider) else {
             *out_count = 0; return std::ptr::null_mut();
         };
-        match (&*db).get_all() {
-            Ok(stops) => {
-                let matching: Vec<GTFSStop> = stops.into_iter()
-                    .filter(|s| s.providers.iter().any(|p| p.as_ref() == prov))
-                    .collect();
-                stops_to_c_string_array(&matching, out_count)
-            }
-            Err(_) => { *out_count = 0; std::ptr::null_mut() }
+        match (&*db).find_by_provider(prov) {
+            Ok(matching) => stops_to_c_string_array(&matching, out_count),
+            Err(_)       => { *out_count = 0; std::ptr::null_mut() }
         }
     }
 }
@@ -580,14 +662,9 @@ pub extern "C" fn stops_db_find_by_code(
         let Some(code_str) = cstr_to_str(stop_code) else {
             *out_count = 0; return std::ptr::null_mut();
         };
-        match (&*db).get_all() {
-            Ok(stops) => {
-                let matching: Vec<GTFSStop> = stops.into_iter()
-                    .filter(|s| s.code.as_deref() == Some(code_str))
-                    .collect();
-                stops_to_c_string_array(&matching, out_count)
-            }
-            Err(_) => { *out_count = 0; std::ptr::null_mut() }
+        match (&*db).find_by_code(code_str) {
+            Ok(matching) => stops_to_c_string_array(&matching, out_count),
+            Err(_)       => { *out_count = 0; std::ptr::null_mut() }
         }
     }
 }

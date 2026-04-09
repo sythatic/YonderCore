@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::io::Read;
 use std::os::raw::c_char;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use flate2::read::DeflateDecoder;
 
@@ -104,22 +104,46 @@ impl TripIdStrategy {
 
 // ── Registry ─────────────────────────────────────────────────────────────────
 
+/// Individual-store handle: each store has its own RwLock so that reads on
+/// already-loaded stores are never blocked by a write (CSV parse) on another
+/// store.  The global `REGISTRY` mutex is held only long enough to clone an
+/// `Arc` — never across any CSV parsing or disk I/O.
+type StoreHandle = Arc<RwLock<GtfsStaticStore>>;
+
 struct Registry {
-    stores:  HashMap<u32, GtfsStaticStore>,
+    stores:  HashMap<u32, StoreHandle>,
     next_id: u32,
 }
 
 impl Registry {
     fn new() -> Self {
         let mut r = Registry { stores: HashMap::new(), next_id: 2 }; // 1 = legacy
-        r.stores.insert(LEGACY_STORE_ID, GtfsStaticStore::new(TripIdStrategy::TripShortName));
+        r.stores.insert(
+            LEGACY_STORE_ID,
+            Arc::new(RwLock::new(GtfsStaticStore::new(TripIdStrategy::TripShortName))),
+        );
         r
     }
 
     fn open(&mut self) -> u32 {
+        // Advance past any IDs already occupied (handles wrapping collisions
+        // when many stores are opened and closed over the lifetime of the app).
+        let start = self.next_id;
+        loop {
+            if !self.stores.contains_key(&self.next_id) { break; }
+            self.next_id = self.next_id.wrapping_add(1).max(2);
+            if self.next_id == start {
+                // All u32 IDs ≥ 2 are occupied — this should never happen in
+                // practice, but panic rather than loop forever.
+                panic!("gtfs_static: store ID space exhausted");
+            }
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(2);
-        self.stores.insert(id, GtfsStaticStore::new(TripIdStrategy::TripShortName));
+        self.stores.insert(
+            id,
+            Arc::new(RwLock::new(GtfsStaticStore::new(TripIdStrategy::TripShortName))),
+        );
         id
     }
 
@@ -128,20 +152,21 @@ impl Registry {
             self.stores.remove(&id);
         }
     }
-
-    fn get(&self, id: u32) -> Option<&GtfsStaticStore> {
-        self.stores.get(&id)
-    }
-
-    fn get_mut(&mut self, id: u32) -> Option<&mut GtfsStaticStore> {
-        self.stores.get_mut(&id)
-    }
 }
 
 static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 
 fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(|| Mutex::new(Registry::new()))
+}
+
+/// Acquire the global registry mutex *briefly* to clone the `Arc` for `id`,
+/// then release it immediately.  All per-store locking is done on the returned
+/// handle, keeping the registry lock out of the hot path.
+#[inline]
+fn get_store(id: u32) -> Option<StoreHandle> {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    reg.stores.get(&id).cloned()
 }
 
 // ── Data model ───────────────────────────────────────────────────────────────
@@ -308,7 +333,7 @@ impl GtfsStaticStore {
         // the first_dep to decide: if (now_local % 86400) < first_dep the
         // trip started on the previous calendar day.
         let first_dep_secs = self.trip_windows.get(canonical.as_str()).map(|w| w.0).unwrap_or(0);
-        let now_sod = (now_local % SECS_PER_DAY) as u32; // seconds since midnight (local)
+        let now_sod = now_local.rem_euclid(SECS_PER_DAY) as u32; // seconds since midnight (local)
         // If the vehicle is past midnight (now_sod < first_dep after 24h wrap),
         // the service date was yesterday.
         let days_offset: i64 = if first_dep_secs >= 86400 && now_sod < first_dep_secs % 86400 {
@@ -351,17 +376,9 @@ impl GtfsStaticStore {
         true
     }
 
-    fn interpolate_position(&mut self, trip_id: &str, now_local: i64) -> Option<(f64, f64)> {
+    fn interpolate_position(&self, trip_id: &str, now_local: i64) -> Option<(f64, f64)> {
         let canonical = self.resolve_trip_id_for_shape(trip_id)?;
-
-        if !self.shape_timelines.contains_key(canonical.as_str()) {
-            let shape_id = self.trip_shape_ids.get(canonical.as_str())?.clone();
-            let shape    = self.shape_points.get(&shape_id)?.clone();
-            let seq      = self.trip_stop_seqs.get(canonical.as_str())?.clone();
-            let timeline = build_timeline(&shape, &seq);
-            self.shape_timelines.insert(canonical.clone(), timeline);
-        }
-
+        // Timelines are built eagerly in build_timelines_eager; no mutation needed here.
         let timeline = self.shape_timelines.get(canonical.as_str())?;
 
         // GTFS stop_times allow times ≥ 24:00:00 (extended times for
@@ -372,7 +389,7 @@ impl GtfsStaticStore {
         // day.  If that fails, try +86400 (the trip started before midnight on
         // the previous schedule day) and +172800 (two days — uncommon but
         // technically valid GTFS).  Stop at the first hit.
-        let since_midnight = now_local % 86_400;
+        let since_midnight = now_local.rem_euclid(86_400);
         query_position(timeline, since_midnight)
             .or_else(|| query_position(timeline, since_midnight + 86_400))
             .or_else(|| query_position(timeline, since_midnight + 172_800))
@@ -416,6 +433,12 @@ impl GtfsStaticStore {
 /// integer division by 86 400 yields the correct local calendar date.
 /// No timezone logic is performed here — this is pure Gregorian arithmetic.
 fn local_midnight_to_yyyymmdd(midnight_local: i64) -> u32 {
+    // Clamp to a plausible GTFS date range before dividing, preventing the
+    // i64→i32 truncation from silently wrapping on adversarial timestamps.
+    // MIN ≈ 1900-01-01 (-25 568 days), MAX ≈ 2270-01-01 (+109 938 days).
+    const MIN_MIDNIGHT: i64 = -25_568 * 86_400;
+    const MAX_MIDNIGHT: i64 =  109_938 * 86_400;
+    let midnight_local = midnight_local.clamp(MIN_MIDNIGHT, MAX_MIDNIGHT);
     // Days since Unix epoch (1970-01-01).
     let days = (midnight_local / 86_400) as i32;
     // Gregorian calendar conversion (proleptic, works for 1970-2100).
@@ -439,6 +462,10 @@ fn day_of_week_from_yyyymmdd(yyyymmdd: u32) -> u8 {
     let m0 = ((yyyymmdd / 100) % 100) as i32;
     let d  = (yyyymmdd % 100) as i32;
     static T: [i32; 12] = [0,3,2,5,0,3,5,1,4,6,2,4];
+    // Guard against invalid YYYYMMDD (month 0 or >12) — T[(m0-1)] would be OOB.
+    // In normal operation m0 is always 1-12 (from local_midnight_to_yyyymmdd),
+    // but defence-in-depth prevents UB if ever called with raw user data.
+    if m0 < 1 || m0 > 12 { return 0; }
     let y = if m0 < 3 { y0 - 1 } else { y0 };
     ((y + y/4 - y/100 + y/400 + T[(m0-1) as usize] + d) % 7) as u8
 }
@@ -519,6 +546,25 @@ fn build_timeline(shape: &[ShapePoint], seq: &TripStopSequence) -> TripShapeTime
     TripShapeTimeline { points: shape.to_vec(), time_at_point }
 }
 
+/// Build shape-interpolation timelines for every trip that has both a shape
+/// and a stop-time sequence in `store`.  Called eagerly after each file load
+/// so `interpolate_position` never needs to mutate the store at query time.
+fn build_timelines_eager(store: &mut GtfsStaticStore) {
+    // Collect (trip_id, timeline) pairs under immutable borrows first,
+    // then extend shape_timelines to avoid conflicting borrow with the iterator.
+    let built: Vec<(String, TripShapeTimeline)> = store
+        .trip_stop_seqs
+        .iter()
+        .filter_map(|(trip_id, seq)| {
+            if store.shape_timelines.contains_key(trip_id.as_str()) { return None; }
+            let shape_id = store.trip_shape_ids.get(trip_id.as_str())?;
+            let shape    = store.shape_points.get(shape_id)?;
+            Some((trip_id.clone(), build_timeline(shape, seq)))
+        })
+        .collect();
+    store.shape_timelines.extend(built);
+}
+
 fn query_position(timeline: &TripShapeTimeline, secs: i64) -> Option<(f64, f64)> {
     let times  = &timeline.time_at_point;
     let points = &timeline.points;
@@ -571,16 +617,19 @@ fn parse_eocd_into(data: &[u8], store: &mut GtfsStaticStore) -> Result<Vec<(Stri
     let cd_size   = u32::from_le_bytes(eocd[12..16].try_into().unwrap()) as u64;
     let cd_offset = u32::from_le_bytes(eocd[16..20].try_into().unwrap()) as u64;
     let tail_start_in_file = (cd_offset + cd_size).saturating_sub(eocd_offset as u64);
-    let cd_offset_in_buf   = (cd_offset - tail_start_in_file) as usize;
+    let cd_offset_in_buf   = cd_offset.checked_sub(tail_start_in_file)
+        .ok_or("EOCD: Central Directory offset underflow — malformed ZIP")? as usize;
+    let cd_end = cd_offset_in_buf.checked_add(cd_size as usize)
+        .ok_or("EOCD: Central Directory offset+size overflow — malformed ZIP")?;
 
-    if cd_offset_in_buf + cd_size as usize > data.len() {
+    if cd_end > data.len() {
         return Err(format!(
             "Central Directory not in tail buffer: need offset {} size {} but have {}",
             cd_offset_in_buf, cd_size, data.len()
         ));
     }
 
-    let cd_data = &data[cd_offset_in_buf..cd_offset_in_buf + cd_size as usize];
+    let cd_data = &data[cd_offset_in_buf..cd_end];
     let mut pos = 0usize;
     let mut entries: HashMap<String, CdEntry> = HashMap::new();
 
@@ -598,7 +647,12 @@ fn parse_eocd_into(data: &[u8], store: &mut GtfsStaticStore) -> Result<Vec<(Stri
         pos += 46;
         if pos + fname_len > cd_data.len() { break; }
         let fname = String::from_utf8_lossy(&cd_data[pos..pos + fname_len]).into_owned();
-        pos += fname_len + extra_len + comment_len;
+        pos = match pos.checked_add(fname_len)
+            .and_then(|p| p.checked_add(extra_len))
+            .and_then(|p| p.checked_add(comment_len)) {
+            Some(p) => p,
+            None    => break,
+        };
         entries.insert(fname, CdEntry { local_header_offset, compressed_size, uncompressed_size, method });
     }
 
@@ -656,6 +710,10 @@ fn parse_gtfs_time(s: &str) -> Option<u32> {
     let hh: u32 = h.parse().ok()?;
     let mm: u32 = m.parse().ok()?;
     let ss: u32 = sec.parse().ok()?;
+    // GTFS allows extended times like 25:30:00 for post-midnight trips, but
+    // clamp hh to defend against malformed feeds: hh > ~1_193_046 overflows
+    // u32 when multiplied by 3600.  Values above 99 are already non-physical.
+    if hh > 99 || mm > 59 || ss > 59 { return None; }
     Some(hh * 3600 + mm * 60 + ss)
 }
 
@@ -665,70 +723,82 @@ fn resolve_stop_time(rec: &csv::StringRecord, dep_idx: Option<usize>, arr_idx: O
         .or_else(|| arr_idx.and_then(|i| rec.get(i)).and_then(parse_gtfs_time))
 }
 
-fn parse_stop_times(data: &[u8]) -> Result<HashMap<String, (u32, u32)>, String> {
+/// Parse stop_times.txt in a **single CSV pass** and produce all three derived maps:
+/// - `trip_windows`: first/last departure second per trip (for `is_trip_active` pre-filter)
+/// - `trip_stop_seqs`: lat/lon/time sequence per trip (for shape interpolation)
+/// - `stop_pickup_types`: non-regular (non-zero) pickup/dropoff entries only
+fn parse_stop_times_all(
+    data:        &[u8],
+    stop_latlon: &HashMap<String, (f64, f64)>,
+) -> Result<(
+    HashMap<String, (u32, u32)>,
+    HashMap<String, TripStopSequence>,
+    HashMap<(String, u32), (u8, u8)>,
+), String> {
     let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
     let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
-    let trip_id_idx = headers.iter().position(|h| h == "trip_id")
-        .ok_or("stop_times.txt: missing trip_id column")?;
-    let arr_idx = headers.iter().position(|h| h == "arrival_time");
-    let dep_idx = headers.iter().position(|h| h == "departure_time");
-    if arr_idx.is_none() && dep_idx.is_none() {
-        return Err("stop_times.txt: missing both arrival_time and departure_time".into());
-    }
-    let mut map: HashMap<String, (u32, u32)> = HashMap::new();
-    for result in rdr.records() {
-        let record  = result.map_err(|e| e.to_string())?;
-        let trip_id = match record.get(trip_id_idx) {
-            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => continue,
-        };
-        let Some(t) = resolve_stop_time(&record, dep_idx, arr_idx) else { continue };
-        map.entry(trip_id)
-            .and_modify(|(first, last)| { if t < *first { *first = t; } else if t > *last { *last = t; } })
-            .or_insert((t, t));
-    }
-    Ok(map)
-}
 
-fn parse_stop_sequences(
-    data: &[u8], stop_latlon: &HashMap<String, (f64, f64)>,
-) -> Result<HashMap<String, TripStopSequence>, String> {
-    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
-    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
     let trip_id_idx = csv_col(&headers, "trip_id")?;
     let stop_id_idx = csv_col(&headers, "stop_id")?;
     let arr_idx     = headers.iter().position(|h| h == "arrival_time");
     let dep_idx     = headers.iter().position(|h| h == "departure_time");
     let seq_idx     = headers.iter().position(|h| h == "stop_sequence");
+    let pickup_idx  = headers.iter().position(|h| h == "pickup_type");
+    let dropoff_idx = headers.iter().position(|h| h == "drop_off_type");
+
     if arr_idx.is_none() && dep_idx.is_none() {
         return Err("stop_times.txt: missing both arrival_time and departure_time".into());
     }
-    struct RawRow { trip_id: String, seq: u32, stop_id: String, time: u32 }
+
+    struct RawRow { trip_id: String, seq: u32, stop_id: String, time: u32, pickup: u8, dropoff: u8 }
     let mut rows: Vec<RawRow> = Vec::new();
+    let mut windows: HashMap<String, (u32, u32)> = HashMap::new();
+
     for result in rdr.records() {
         let rec = result.map_err(|e| e.to_string())?;
         let trip_id = match rec.get(trip_id_idx) {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
             _ => continue,
         };
-        let stop_id = rec.get(stop_id_idx).unwrap_or("").trim().to_string();
-        let seq: u32 = parse_col_u32(seq_idx, &rec);
         let Some(time) = resolve_stop_time(&rec, dep_idx, arr_idx) else { continue };
-        rows.push(RawRow { trip_id, seq, stop_id, time });
+        let stop_id = rec.get(stop_id_idx).unwrap_or("").trim().to_string();
+        let seq:    u32 = parse_col_u32(seq_idx,    &rec);
+        let pickup:  u8 = parse_col_u32(pickup_idx,  &rec) as u8;
+        let dropoff: u8 = parse_col_u32(dropoff_idx, &rec) as u8;
+
+        windows.entry(trip_id.clone())
+            .and_modify(|(first, last)| {
+                if time < *first { *first = time; } else if time > *last { *last = time; }
+            })
+            .or_insert((time, time));
+
+        rows.push(RawRow { trip_id, seq, stop_id, time, pickup, dropoff });
     }
+
     rows.sort_by(|a, b| a.trip_id.cmp(&b.trip_id).then(a.seq.cmp(&b.seq)));
-    let mut map: HashMap<String, TripStopSequence> = HashMap::new();
+
+    let mut seqs:         HashMap<String, TripStopSequence>    = HashMap::new();
+    let mut pickup_types: HashMap<(String, u32), (u8, u8)>    = HashMap::new();
+
     for row in &rows {
-        let (lat, lon) = stop_latlon.get(&row.stop_id).copied().unwrap_or((0.0, 0.0));
-        let entry = map.entry(row.trip_id.clone()).or_insert_with(|| TripStopSequence {
+        let (lat, lon) = stop_latlon.get(&row.stop_id).copied().unwrap_or_else(|| {
+            eprintln!("gtfs_static: stop_id '{}' in stop_times.txt not found in stops.txt; using (0,0)", row.stop_id);
+            (0.0, 0.0)
+        });
+        let entry = seqs.entry(row.trip_id.clone()).or_insert_with(|| TripStopSequence {
             stop_lats: Vec::new(), stop_lons: Vec::new(), dep_secs: Vec::new(),
         });
         entry.stop_lats.push(lat);
         entry.stop_lons.push(lon);
         entry.dep_secs.push(row.time);
+
+        if row.pickup != 0 || row.dropoff != 0 {
+            pickup_types.insert((row.trip_id.clone(), row.seq), (row.pickup, row.dropoff));
+        }
     }
-    map.retain(|_, seq| seq.dep_secs.len() >= 2);
-    Ok(map)
+    seqs.retain(|_, s| s.dep_secs.len() >= 2);
+
+    Ok((windows, seqs, pickup_types))
 }
 
 /// Returns (display_names, short_names).
@@ -906,39 +976,6 @@ fn parse_calendar_dates(data: &[u8]) -> Result<HashMap<(String, u32), u8>, Strin
     Ok(map)
 }
 
-/// Parse stop_times.txt for pickup_type / dropoff_type per (trip_id, stop_sequence).
-/// Returns only rows where at least one type is non-zero (non-regular service).
-/// Used to filter non-revenue stops from next-stop results.
-fn parse_stop_pickup_types(data: &[u8]) -> Result<HashMap<(String, u32), (u8, u8)>, String> {
-    let mut rdr = csv::ReaderBuilder::new().flexible(true).from_reader(data);
-    let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
-    let trip_id_idx  = csv_col(&headers, "trip_id")?;
-    let seq_idx      = headers.iter().position(|h| h == "stop_sequence");
-    let pickup_idx   = headers.iter().position(|h| h == "pickup_type");
-    let dropoff_idx  = headers.iter().position(|h| h == "drop_off_type");
-
-    // If neither pickup nor dropoff columns exist, return empty (all regular).
-    if pickup_idx.is_none() && dropoff_idx.is_none() {
-        return Ok(HashMap::new());
-    }
-
-    let mut map = HashMap::new();
-    for result in rdr.records() {
-        let rec = result.map_err(|e| e.to_string())?;
-        let trip_id = match rec.get(trip_id_idx) {
-            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-            _ => continue,
-        };
-        let seq:    u32 = parse_col_u32(seq_idx,    &rec);
-        let pickup:  u8 = parse_col_u32(pickup_idx,  &rec) as u8;
-        let dropoff: u8 = parse_col_u32(dropoff_idx, &rec) as u8;
-        // Only store non-default rows to keep memory usage low.
-        if pickup != 0 || dropoff != 0 {
-            map.insert((trip_id, seq), (pickup, dropoff));
-        }
-    }
-    Ok(map)
-}
 /// Returns `(train_number, secondary_key)`.
 /// `secondary_key` is an extra alias inserted into the trips table so that
 /// RT trip_ids with a prefixed format (e.g. `"{DATE}_{STATIC_ID}"`) can still
@@ -1094,9 +1131,11 @@ fn feed_file_into(store: &mut GtfsStaticStore, fname: &str, slice: &[u8]) -> i32
         "trips.txt" => {
             // routes.txt should be fed before trips.txt so route_short_names is
             // already populated when RouteShortName strategy needs it.
-            let strategy          = store.strategy;
-            let route_short_names = store.route_short_names.clone();
-            match parse_trips_with_strategy(&decompressed, strategy, &route_short_names) {
+            // Capture the result first so the immutable borrow of
+            // store.route_short_names ends before the mutable merge below.
+            let strategy = store.strategy;
+            let result   = parse_trips_with_strategy(&decompressed, strategy, &store.route_short_names);
+            match result {
                 Ok((trips_map, shape_id_map, service_id_map, direction_map, headsign_map, block_id_map)) => {
                     for (k, v) in trips_map     { store.trips.entry(k).or_insert(v); }
                     for (k, v) in shape_id_map  { store.trip_shape_ids.entry(k).or_insert(v); }
@@ -1116,26 +1155,31 @@ fn feed_file_into(store: &mut GtfsStaticStore, fname: &str, slice: &[u8]) -> i32
         },
 
         "stop_times.txt" => {
-            // Parse trip time windows (for is_trip_active fast pre-filter).
-            match parse_stop_times(&decompressed) {
-                Ok(map) => { store.trip_windows.extend(map); }
-                Err(e)  => { eprintln!("parse_stop_times: {}", e); return -1; }
-            }
-            // Parse stop sequences (for shape interpolation).
-            let stop_latlon = store.stop_latlon.clone();
-            match parse_stop_sequences(&decompressed, &stop_latlon) {
-                Ok(map) => { store.trip_stop_seqs.extend(map); }
-                Err(e)  => { eprintln!("parse_stop_sequences: {}", e); return -1; }
-            }
-            // Parse pickup/dropoff types so non-revenue stops can be flagged.
-            match parse_stop_pickup_types(&decompressed) {
-                Ok(map) => { store.stop_pickup_types.extend(map); 0 }
-                Err(e)  => { eprintln!("parse_stop_pickup_types: {}", e); 0 } // non-fatal
+            // Single-pass parse: produces trip_windows, trip_stop_seqs, and
+            // stop_pickup_types all at once instead of three separate CSV scans.
+            let result = parse_stop_times_all(&decompressed, &store.stop_latlon);
+            match result {
+                Ok((windows, seqs, pickup_types)) => {
+                    store.trip_windows.extend(windows);
+                    store.trip_stop_seqs.extend(seqs);
+                    store.stop_pickup_types.extend(pickup_types);
+                    // Eagerly build any timelines now possible (requires shapes.txt
+                    // already loaded; if not, shapes.txt load will finish the job).
+                    build_timelines_eager(store);
+                    0
+                }
+                Err(e) => { eprintln!("parse_stop_times: {}", e); -1 }
             }
         },
 
         "shapes.txt" => match parse_shapes(&decompressed) {
-            Ok(map) => { store.shape_points.extend(map); 0 }
+            Ok(map) => {
+                store.shape_points.extend(map);
+                // Eagerly build any timelines now possible (requires stop_times.txt
+                // already loaded; if not, stop_times.txt load will finish the job).
+                build_timelines_eager(store);
+                0
+            }
             Err(e)  => { eprintln!("parse_shapes: {}", e); -1 }
         },
 
@@ -1185,7 +1229,7 @@ pub struct InterpolatedPosition {
 // ── FFI helpers ───────────────────────────────────────────────────────────────
 
 fn ranges_to_ffi(ranges: Vec<(String, u64, u64)>, out_count: *mut usize) -> *mut GTFSZipRange {
-    let mut out: Vec<GTFSZipRange> = ranges.into_iter()
+    let out: Vec<GTFSZipRange> = ranges.into_iter()
         .filter_map(|(name, offset, len)| {
             CString::new(name).ok().map(|cs| GTFSZipRange {
                 filename: cs.into_raw(), byte_offset: offset, byte_length: len,
@@ -1194,8 +1238,11 @@ fn ranges_to_ffi(ranges: Vec<(String, u64, u64)>, out_count: *mut usize) -> *mut
         .collect();
     let count = out.len();
     unsafe { *out_count = count };
-    let ptr = out.as_mut_ptr();
-    std::mem::forget(out);
+    // Use into_boxed_slice so capacity == length; capacity mismatch in the
+    // corresponding free function would be undefined behaviour.
+    let mut boxed: Box<[GTFSZipRange]> = out.into_boxed_slice();
+    let ptr = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
     ptr
 }
 
@@ -1232,7 +1279,7 @@ fn make_static_result(found: Option<(String, String)>) -> *mut GTFSStaticResult 
 /// Call `gtfs_static_store_set_strategy` before feeding files to change it.
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_new() -> u32 {
-    registry().lock().unwrap().open()
+    registry().lock().unwrap_or_else(|e| e.into_inner()).open()
 }
 
 /// Release the store identified by `store_id`.
@@ -1240,7 +1287,7 @@ pub extern "C" fn gtfs_static_store_new() -> u32 {
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_free(store_id: u32) {
     if store_id == 0 { return; }
-    registry().lock().unwrap().close(store_id);
+    registry().lock().unwrap_or_else(|e| e.into_inner()).close(store_id);
 }
 
 /// Set the trip-id extraction strategy for `store_id`.
@@ -1253,10 +1300,9 @@ pub extern "C" fn gtfs_static_store_free(store_id: u32) {
 ///   3 = TripIdVerbatim     — use `trip_id` as-is
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_set_strategy(store_id: u32, strategy: i32) {
-    let mut reg = registry().lock().unwrap();
-    if let Some(store) = reg.get_mut(store_id) {
-        store.strategy = TripIdStrategy::from_i32(strategy);
-    }
+    let Some(handle) = get_store(store_id) else { return };
+    let mut store = handle.write().unwrap_or_else(|e| e.into_inner());
+    store.strategy = TripIdStrategy::from_i32(strategy);
 }
 
 /// Step 1 of the loading protocol: feed the ZIP tail bytes.
@@ -1272,13 +1318,16 @@ pub extern "C" fn gtfs_static_store_feed_eocd(
     unsafe { *out_count = 0 };
     if store_id == 0 || data.is_null() || data_len == 0 { return std::ptr::null_mut(); }
 
-    let slice   = unsafe { std::slice::from_raw_parts(data, data_len) };
-    let mut reg = registry().lock().unwrap();
-    let Some(store) = reg.get_mut(store_id) else { return std::ptr::null_mut() };
+    let slice = unsafe { std::slice::from_raw_parts(data, data_len) };
+    let Some(handle) = get_store(store_id) else { return std::ptr::null_mut() };
+    let mut store = handle.write().unwrap_or_else(|e| e.into_inner());
 
-    match parse_eocd_into(slice, store) {
-        Ok(ranges) => ranges_to_ffi(ranges, out_count),
-        Err(e)     => { eprintln!("gtfs_static_store_feed_eocd: {}", e); std::ptr::null_mut() }
+    match parse_eocd_into(slice, &mut *store) {
+        Ok(ranges) => {
+            drop(store); // release write lock before allocating FFI output
+            ranges_to_ffi(ranges, out_count)
+        }
+        Err(e) => { eprintln!("gtfs_static_store_feed_eocd: {}", e); std::ptr::null_mut() }
     }
 }
 
@@ -1293,15 +1342,17 @@ pub extern "C" fn gtfs_static_store_feed_file(
     data:     *const u8,
     data_len: usize,
 ) -> i32 {
-    if store_id == 0 || filename.is_null() || data.is_null() { return -1; }
+    if store_id == 0 || filename.is_null() || data.is_null() || data_len == 0 { return -1; }
     let fname = match unsafe { CStr::from_ptr(filename).to_str() } {
         Ok(s)  => s.to_string(),
         Err(_) => return -1,
     };
-    let slice   = unsafe { std::slice::from_raw_parts(data, data_len) };
-    let mut reg = registry().lock().unwrap();
-    let Some(store) = reg.get_mut(store_id) else { return -1 };
-    feed_file_into(store, &fname, slice)
+    let slice = unsafe { std::slice::from_raw_parts(data, data_len) };
+    // Acquire the individual store write lock — NOT the global registry lock.
+    // This allows concurrent reads on all other stores while this CSV is parsed.
+    let Some(handle) = get_store(store_id) else { return -1 };
+    let mut store = handle.write().unwrap_or_else(|e| e.into_inner());
+    feed_file_into(&mut *store, &fname, slice)
 }
 
 /// Look up a realtime `trip_id` in `store_id`.
@@ -1318,16 +1369,19 @@ pub extern "C" fn gtfs_static_store_lookup(
         Ok(s)  => s,
         Err(_) => return make_static_result(None),
     };
-    let reg = registry().lock().unwrap();
-    let found = reg.get(store_id).and_then(|s| s.lookup(tid));
+    let Some(handle) = get_store(store_id) else { return make_static_result(None) };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
+    let found = store.lookup(tid);
+    drop(store); // release read lock before allocating FFI output
     make_static_result(found)
 }
 
 /// Returns 1 if routes, trips, and stop_times are loaded in `store_id`.
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_is_loaded(store_id: u32) -> i32 {
-    let reg = registry().lock().unwrap();
-    reg.get(store_id).map(|s| if s.is_loaded() { 1 } else { 0 }).unwrap_or(0)
+    let Some(handle) = get_store(store_id) else { return 0 };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
+    if store.is_loaded() { 1 } else { 0 }
 }
 
 /// Returns 1 if `trip_id` is scheduled as active at `now_local` in `store_id`.
@@ -1335,15 +1389,15 @@ pub extern "C" fn gtfs_static_store_is_loaded(store_id: u32) -> i32 {
 pub extern "C" fn gtfs_static_store_is_trip_active(
     store_id:    u32,
     trip_id:     *const c_char,
-    now_local: i64,
+    now_local:   i64,
 ) -> i32 {
     if store_id == 0 || trip_id.is_null() { return 0; }
     let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } {
         Ok(s)  => s,
         Err(_) => return 0,
     };
-    let reg = registry().lock().unwrap();
-    let Some(store) = reg.get(store_id) else { return 0 };
+    let Some(handle) = get_store(store_id) else { return 0 };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
     if store.trip_windows.is_empty() { return 1; }
     if store.is_trip_active(tid, now_local) { 1 } else { 0 }
 }
@@ -1354,7 +1408,7 @@ pub extern "C" fn gtfs_static_store_is_trip_active(
 pub extern "C" fn gtfs_static_store_interpolate(
     store_id:    u32,
     trip_id:     *const c_char,
-    now_local: i64,
+    now_local:   i64,
 ) -> InterpolatedPosition {
     let null = InterpolatedPosition { lat: 0.0, lon: 0.0, is_valid: 0 };
     if store_id == 0 || trip_id.is_null() { return null; }
@@ -1362,8 +1416,8 @@ pub extern "C" fn gtfs_static_store_interpolate(
         Ok(s)  => s,
         Err(_) => return null,
     };
-    let mut reg = registry().lock().unwrap();
-    let Some(store) = reg.get_mut(store_id) else { return null };
+    let Some(handle) = get_store(store_id) else { return null };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
     match store.interpolate_position(tid, now_local) {
         Some((lat, lon)) => InterpolatedPosition { lat, lon, is_valid: 1 },
         None             => null,
@@ -1373,15 +1427,17 @@ pub extern "C" fn gtfs_static_store_interpolate(
 /// Returns 1 when shape interpolation data is fully loaded for `store_id`.
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_interpolation_ready(store_id: u32) -> i32 {
-    let reg = registry().lock().unwrap();
-    reg.get(store_id).map(|s| if s.interpolation_ready() { 1 } else { 0 }).unwrap_or(0)
+    let Some(handle) = get_store(store_id) else { return 0 };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
+    if store.interpolation_ready() { 1 } else { 0 }
 }
 
 /// Evict all data from `store_id` (preserves strategy).
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_reset(store_id: u32) {
-    let mut reg = registry().lock().unwrap();
-    if let Some(store) = reg.get_mut(store_id) { store.reset(); }
+    let Some(handle) = get_store(store_id) else { return };
+    let mut store = handle.write().unwrap_or_else(|e| e.into_inner());
+    store.reset();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1427,11 +1483,11 @@ pub extern "C" fn gtfs_static_free_result(result: *mut GTFSStaticResult) {
 pub extern "C" fn gtfs_static_free_ranges(ranges: *mut GTFSZipRange, count: usize) {
     if ranges.is_null() || count == 0 { return; }
     unsafe {
-        let slice = std::slice::from_raw_parts_mut(ranges, count);
-        for r in slice.iter() {
+        // Reconstruct the Box<[GTFSZipRange]> produced by ranges_to_ffi.
+        let boxed = Box::from_raw(std::slice::from_raw_parts_mut(ranges, count));
+        for r in boxed.iter() {
             if !r.filename.is_null() { let _ = CString::from_raw(r.filename as *mut c_char); }
         }
-        let _ = Vec::from_raw_parts(ranges, count, count);
     }
 }
 
@@ -1496,8 +1552,8 @@ pub extern "C" fn gtfs_static_store_get_direction_id(
 ) -> i32 {
     if store_id == 0 || trip_id.is_null() { return -1; }
     let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return -1 };
-    let reg = registry().lock().unwrap();
-    let store = match reg.get(store_id) { Some(s) => s, None => return -1 };
+    let Some(handle) = get_store(store_id) else { return -1 };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
     // Try canonical trip_id, then last segment of mangled RT id.
     let dir = store.trip_direction_ids.get(tid)
         .or_else(|| {
@@ -1516,14 +1572,16 @@ pub extern "C" fn gtfs_static_store_get_headsign(
 ) -> *const c_char {
     if store_id == 0 || trip_id.is_null() { return std::ptr::null(); }
     let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return std::ptr::null() };
-    let reg = registry().lock().unwrap();
-    let store = match reg.get(store_id) { Some(s) => s, None => return std::ptr::null() };
+    let Some(handle) = get_store(store_id) else { return std::ptr::null() };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
     let hs = store.trip_headsigns.get(tid)
         .or_else(|| {
             if tid.contains('_') { tid.split('_').last().and_then(|last| store.trip_headsigns.get(last)) }
             else { None }
         });
-    optional_str_to_cstr(hs)
+    let result = optional_str_to_cstr(hs);
+    drop(store); // release read lock before returning CString pointer
+    result
 }
 
 /// Returns a heap-allocated C string with the service_id for `trip_id`.
@@ -1535,24 +1593,25 @@ pub extern "C" fn gtfs_static_store_get_service_id(
 ) -> *const c_char {
     if store_id == 0 || trip_id.is_null() { return std::ptr::null(); }
     let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return std::ptr::null() };
-    let reg = registry().lock().unwrap();
-    let store = match reg.get(store_id) { Some(s) => s, None => return std::ptr::null() };
+    let Some(handle) = get_store(store_id) else { return std::ptr::null() };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
     let sid = store.trip_service_ids.get(tid)
         .or_else(|| {
             if tid.contains('_') { tid.split('_').last().and_then(|last| store.trip_service_ids.get(last)) }
             else { None }
         });
-    optional_str_to_cstr(sid)
+    let result = optional_str_to_cstr(sid);
+    drop(store); // release read lock before returning CString pointer
+    result
 }
 
 /// Returns 1 if calendar.txt or calendar_dates.txt data has been loaded for `store_id`.
 /// Returns 0 when the store has no service-day data (is_trip_active will pass-through).
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_calendar_loaded(store_id: u32) -> i32 {
-    let reg = registry().lock().unwrap();
-    reg.get(store_id)
-        .map(|s| if !s.calendar.is_empty() || !s.calendar_dates.is_empty() { 1 } else { 0 })
-        .unwrap_or(0)
+    let Some(handle) = get_store(store_id) else { return 0 };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
+    if !store.calendar.is_empty() || !store.calendar_dates.is_empty() { 1 } else { 0 }
 }
 
 /// Returns 1 if the stop at `(trip_id, stop_sequence)` accepts revenue passengers
@@ -1567,8 +1626,8 @@ pub extern "C" fn gtfs_static_store_is_stop_revenue(
 ) -> i32 {
     if store_id == 0 || trip_id.is_null() { return 1; }
     let tid = match unsafe { CStr::from_ptr(trip_id).to_str() } { Ok(s) => s, Err(_) => return 1 };
-    let reg = registry().lock().unwrap();
-    let store = match reg.get(store_id) { Some(s) => s, None => return 1 };
+    let Some(handle) = get_store(store_id) else { return 1 };
+    let store = handle.read().unwrap_or_else(|e| e.into_inner());
     match store.stop_pickup_types.get(&(tid.to_string(), stop_sequence)) {
         // pickup_type=1 AND dropoff_type=1 means no service (timing point / deadhead).
         Some(&(1, 1)) => 0,

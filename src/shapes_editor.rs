@@ -58,6 +58,18 @@ impl Registry {
     }
 
     fn open(&mut self) -> u32 {
+        // Advance past any IDs already occupied (handles wrapping collisions
+        // when many stores are opened and closed over the lifetime of the app).
+        let start = self.next_id;
+        loop {
+            if !self.stores.contains_key(&self.next_id) { break; }
+            self.next_id = self.next_id.wrapping_add(1).max(1); // skip 0
+            if self.next_id == start {
+                // All u32 IDs ≥ 1 are occupied — this should never happen in
+                // practice, but panic rather than loop forever.
+                panic!("shapes_editor: store ID space exhausted");
+            }
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1); // skip 0
         self.stores.insert(id, ShapesEditorStore::new());
@@ -83,6 +95,79 @@ fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(|| Mutex::new(Registry::new()))
 }
 
+// ── CSV parser (lock-free) ────────────────────────────────────────────────────
+
+/// Parse shapes.txt from any `BufRead` without holding the registry lock.
+/// Returns `(shapes_map, total_point_count)`.
+fn parse_shapes_csv<R: std::io::BufRead>(
+    reader: R,
+) -> Result<(BTreeMap<String, BTreeMap<u32, (f64, f64)>>, usize), String> {
+    let mut shapes: BTreeMap<String, BTreeMap<u32, (f64, f64)>> = BTreeMap::new();
+    let mut total      = 0usize;
+    let mut line_no    = 0usize;
+    let mut buf        = String::new();
+    let mut saw_header = false;
+    let mut reader     = reader;
+
+    let mut col_id  = 0usize;
+    let mut col_lat = 1usize;
+    let mut col_lon = 2usize;
+    let mut col_seq = 3usize;
+
+    loop {
+        buf.clear();
+        let n = reader.read_line(&mut buf)
+            .map_err(|e| format!("line {}: I/O error: {}", line_no + 1, e))?;
+        if n == 0 { break; }
+
+        line_no += 1;
+        // Strip UTF-8 BOM (EF BB BF) from the very first line.
+        let line = if line_no == 1 { buf.trim().trim_start_matches('\u{feff}') } else { buf.trim() };
+        if line.is_empty() { continue; }
+
+        if !saw_header {
+            saw_header = true;
+            let low = line.to_ascii_lowercase();
+            if low.contains("shape_id") || low.contains("shape_pt_lat") {
+                for (i, h) in line.split(',').map(|h| h.trim()).enumerate() {
+                    match h.to_ascii_lowercase().trim_start_matches('\u{feff}') {
+                        "shape_id"          => col_id  = i,
+                        "shape_pt_lat"      => col_lat = i,
+                        "shape_pt_lon"      => col_lon = i,
+                        "shape_pt_sequence" => col_seq = i,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+        }
+
+        let cols: Vec<&str> = line.split(',').collect();
+        let max_idx = col_id.max(col_lat).max(col_lon).max(col_seq);
+        if cols.len() <= max_idx {
+            return Err(format!("line {}: only {} columns, need index {}",
+                               line_no, cols.len(), max_idx));
+        }
+
+        let shape_id = cols[col_id].trim();
+        let lat_str  = cols[col_lat].trim();
+        let lon_str  = cols[col_lon].trim();
+        let seq_str  = cols[col_seq].trim();
+
+        let lat: f64 = lat_str.parse()
+            .map_err(|_| format!("line {}: invalid lat '{}'", line_no, lat_str))?;
+        let lon: f64 = lon_str.parse()
+            .map_err(|_| format!("line {}: invalid lon '{}'", line_no, lon_str))?;
+        let seq: u32 = seq_str.parse()
+            .map_err(|_| format!("line {}: invalid seq '{}'", line_no, seq_str))?;
+
+        shapes.entry(shape_id.to_string()).or_default().insert(seq, (lat, lon));
+        total += 1;
+    }
+
+    Ok((shapes, total))
+}
+
 // ── Data model ────────────────────────────────────────────────────────────────
 
 /// Internal per-point representation.
@@ -100,76 +185,6 @@ impl ShapesEditorStore {
     }
 
     // ── Parsing ──────────────────────────────────────────────────────────────
-
-    fn load<R: std::io::BufRead>(&mut self, reader: R) -> Result<usize, String> {
-        let mut new_shapes: BTreeMap<String, BTreeMap<u32, (f64, f64)>> = BTreeMap::new();
-        let mut total      = 0usize;
-        let mut line_no    = 0usize;
-        let mut buf        = String::new();
-        let mut saw_header = false;
-        let mut reader     = reader;
-
-        let mut col_id  = 0usize;
-        let mut col_lat = 1usize;
-        let mut col_lon = 2usize;
-        let mut col_seq = 3usize;
-
-        loop {
-            buf.clear();
-            let n = reader.read_line(&mut buf)
-                .map_err(|e| format!("line {}: I/O error: {}", line_no + 1, e))?;
-            if n == 0 { break; }
-
-            line_no += 1;
-            let line = buf.trim();
-            if line.is_empty() { continue; }
-
-            if !saw_header {
-                saw_header = true;
-                let low = line.to_ascii_lowercase();
-                if low.contains("shape_id") || low.contains("shape_pt_lat") {
-                    for (i, h) in line.split(',').map(|h| h.trim()).enumerate() {
-                        match h.to_ascii_lowercase().as_str() {
-                            "shape_id"          => col_id  = i,
-                            "shape_pt_lat"      => col_lat = i,
-                            "shape_pt_lon"      => col_lon = i,
-                            "shape_pt_sequence" => col_seq = i,
-                            _ => {}
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            let cols: Vec<&str> = line.split(',').collect();
-            let max_idx = col_id.max(col_lat).max(col_lon).max(col_seq);
-            if cols.len() <= max_idx {
-                return Err(format!("line {}: only {} columns, need index {}",
-                                   line_no, cols.len(), max_idx));
-            }
-
-            let shape_id = cols[col_id].trim();
-            let lat_str  = cols[col_lat].trim();
-            let lon_str  = cols[col_lon].trim();
-            let seq_str  = cols[col_seq].trim();
-
-            let lat: f64 = lat_str.parse()
-                .map_err(|_| format!("line {}: invalid lat '{}'", line_no, lat_str))?;
-            let lon: f64 = lon_str.parse()
-                .map_err(|_| format!("line {}: invalid lon '{}'", line_no, lon_str))?;
-            let seq: u32 = seq_str.parse()
-                .map_err(|_| format!("line {}: invalid seq '{}'", line_no, seq_str))?;
-
-            new_shapes
-                .entry(shape_id.to_string())
-                .or_default()
-                .insert(seq, (lat, lon));
-            total += 1;
-        }
-
-        self.shapes = new_shapes;
-        Ok(total)
-    }
 
     // ── Serialisation ────────────────────────────────────────────────────────
 
@@ -239,6 +254,9 @@ impl ShapesEditorStore {
 
         let pts = self.shapes.entry(shape_id.to_string()).or_default();
 
+        // BTreeMap::keys() iterates in ascending sorted order, so `to_bump` is
+        // ordered from smallest to largest sequence number.  `to_bump.last()`
+        // therefore yields the maximum sequence — the one most likely to wrap.
         let to_bump: Vec<u32> = pts.keys()
             .filter(|&&s| s >= new_seq)
             .copied()
@@ -337,7 +355,7 @@ macro_rules! ffi_catch {
 #[no_mangle]
 pub extern "C" fn shapes_editor_open() -> u32 {
     ffi_catch!(0, {
-        registry().lock().unwrap().open()
+        registry().lock().unwrap_or_else(|e| e.into_inner()).open()
     })
 }
 
@@ -346,7 +364,7 @@ pub extern "C" fn shapes_editor_open() -> u32 {
 #[no_mangle]
 pub extern "C" fn shapes_editor_close(store_id: u32) {
     ffi_catch!((), {
-        registry().lock().unwrap().close(store_id);
+        registry().lock().unwrap_or_else(|e| e.into_inner()).close(store_id);
     });
 }
 
@@ -375,18 +393,25 @@ pub extern "C" fn shapes_editor_load(
                 return -1;
             }
         };
+        // Parse the CSV entirely outside the mutex so other stores are not
+        // blocked for the duration of a potentially large file read.
         let reader = std::io::BufReader::new(file);
-
-        let mut reg = registry().lock().unwrap();
+        let (new_shapes, total) = match parse_shapes_csv(reader) {
+            Ok(r)  => r,
+            Err(e) => {
+                eprintln!("shapes_editor_load: parse error: {}", e);
+                unsafe { *out_count = 0; }
+                return -1;
+            }
+        };
+        // Acquire the lock only to swap in the pre-parsed data.
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(store_id) {
             None => { unsafe { *out_count = 0; } -1 }
-            Some(ed) => match ed.load(reader) {
-                Ok(total) => { unsafe { *out_count = total; } 0 }
-                Err(e)    => {
-                    eprintln!("shapes_editor_load: parse error: {}", e);
-                    unsafe { *out_count = 0; }
-                    -1
-                }
+            Some(ed) => {
+                ed.shapes = new_shapes;
+                unsafe { *out_count = total; }
+                0
             }
         }
     })
@@ -404,16 +429,32 @@ pub extern "C" fn shapes_editor_save(store_id: u32, path: *const c_char) -> i32 
             Err(_) => return -1,
         };
 
-        let reg = registry().lock().unwrap();
-        match reg.get(store_id) {
-            None     => -1,
-            Some(ed) => {
-                let csv = ed.to_csv_bytes();
-                drop(reg);
-                match std::fs::write(path_str, &csv) {
-                    Ok(_)  => 0,
-                    Err(e) => { eprintln!("shapes_editor_save: {}", e); -1 }
-                }
+        // Clone shapes under the lock, then release the lock before the
+        // O(n) serialization so other threads are not blocked.
+        let shapes_clone = {
+            let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            match reg.get(store_id) {
+                None     => return -1,
+                Some(ed) => ed.shapes.clone(),
+            }
+        };
+
+        let tmp = ShapesEditorStore { shapes: shapes_clone };
+        let csv = tmp.to_csv_bytes();
+
+        // Write atomically: write to a temp file then rename so that a partial
+        // write or crash never leaves the destination file in a corrupt state.
+        let tmp_path = format!("{}.tmp", path_str);
+        if let Err(e) = std::fs::write(&tmp_path, &csv) {
+            eprintln!("shapes_editor_save: write error: {}", e);
+            return -1;
+        }
+        match std::fs::rename(&tmp_path, path_str) {
+            Ok(_) => 0,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                eprintln!("shapes_editor_save: rename error: {}", e);
+                -1
             }
         }
     })
@@ -424,7 +465,7 @@ pub extern "C" fn shapes_editor_save(store_id: u32, path: *const c_char) -> i32 
 #[no_mangle]
 pub extern "C" fn shapes_editor_get_shape_ids(store_id: u32) -> *mut c_char {
     ffi_catch!(std::ptr::null_mut(), {
-        let reg = registry().lock().unwrap();
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get(store_id) {
             None     => std::ptr::null_mut(),
             Some(ed) => {
@@ -469,7 +510,7 @@ pub extern "C" fn shapes_editor_get_shape(
             Err(_) => { unsafe { *out_count = 0; } return std::ptr::null_mut(); }
         };
 
-        let reg = registry().lock().unwrap();
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get(store_id) {
             None     => { unsafe { *out_count = 0; } std::ptr::null_mut() }
             Some(ed) => {
@@ -503,7 +544,7 @@ pub extern "C" fn shapes_editor_get_all(
     if out_count.is_null() { return std::ptr::null_mut(); }
 
     ffi_catch!(std::ptr::null_mut(), {
-        let reg = registry().lock().unwrap();
+        let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get(store_id) {
             None     => { unsafe { *out_count = 0; } std::ptr::null_mut() }
             Some(ed) => {
@@ -521,7 +562,7 @@ pub extern "C" fn shapes_editor_get_all(
 #[no_mangle]
 pub extern "C" fn shapes_editor_point_count(store_id: u32) -> usize {
     ffi_catch!(0, {
-        registry().lock().unwrap()
+        registry().lock().unwrap_or_else(|e| e.into_inner())
             .get(store_id)
             .map(|ed| ed.point_count())
             .unwrap_or(0)
@@ -543,7 +584,7 @@ pub extern "C" fn shapes_editor_update_point(
             Ok(s)  => s,
             Err(_) => return 0,
         };
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(store_id) {
             None     => 0,
             Some(ed) => if ed.update_point(sid, sequence, new_lat, new_lon) { 1 } else { 0 },
@@ -564,7 +605,7 @@ pub extern "C" fn shapes_editor_delete_point(
             Ok(s)  => s,
             Err(_) => return 0,
         };
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(store_id) {
             None     => 0,
             Some(ed) => if ed.delete_point(sid, sequence) { 1 } else { 0 },
@@ -587,7 +628,7 @@ pub extern "C" fn shapes_editor_insert_point(
             Ok(s)  => s,
             Err(_) => return 0,
         };
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(store_id) {
             None     => 0,
             Some(ed) => if ed.insert_point(sid, after_sequence, lat, lon) { 1 } else { 0 },
@@ -607,7 +648,7 @@ pub extern "C" fn shapes_editor_delete_shape(
             Ok(s)  => s,
             Err(_) => return 0,
         };
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(store_id) {
             None     => 0,
             Some(ed) => if ed.delete_shape(sid) { 1 } else { 0 },
@@ -627,7 +668,7 @@ pub extern "C" fn shapes_editor_add_shape(
             Ok(s)  => s,
             Err(_) => return 0,
         };
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         match reg.get_mut(store_id) {
             None     => 0,
             Some(ed) => if ed.add_shape(sid) { 1 } else { 0 },
@@ -639,7 +680,7 @@ pub extern "C" fn shapes_editor_add_shape(
 #[no_mangle]
 pub extern "C" fn shapes_editor_reset(store_id: u32) {
     ffi_catch!((), {
-        let mut reg = registry().lock().unwrap();
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ed) = reg.get_mut(store_id) {
             ed.shapes.clear();
         }

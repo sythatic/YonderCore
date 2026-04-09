@@ -35,7 +35,7 @@ impl TileMeta {
     pub fn new_success(expiration_secs: i64, data_size: u32) -> Self {
         let now = current_timestamp();
         Self {
-            expiration: now + expiration_secs,
+            expiration: now.saturating_add(expiration_secs),
             download_time: now,
             data_size,
             http_status: 200,
@@ -48,7 +48,7 @@ impl TileMeta {
     pub fn new_negative(expiration_secs: i64) -> Self {
         let now = current_timestamp();
         Self {
-            expiration: now + expiration_secs,
+            expiration: now.saturating_add(expiration_secs),
             download_time: now,
             data_size: 0,
             http_status: 404,
@@ -154,11 +154,14 @@ pub struct CacheStatsSnapshot {
 impl CacheStatsSnapshot {
     #[inline]
     pub fn total_requests(&self) -> u64 {
-        self.memory_hits + self.disk_hits + self.network_fetches + self.cache_misses
+        self.memory_hits
+            .saturating_add(self.disk_hits)
+            .saturating_add(self.network_fetches)
+            .saturating_add(self.cache_misses)
     }
 
     pub fn hit_rate(&self) -> f64 {
-        let hits = self.memory_hits + self.disk_hits;
+        let hits = self.memory_hits.saturating_add(self.disk_hits);
         let total = self.total_requests();
         if total > 0 {
             hits as f64 / total as f64
@@ -188,8 +191,6 @@ pub struct TileCacheCore {
     statistics: Arc<CacheStatistics>,
     memory_cache: Arc<RwLock<HashMap<String, MemoryCacheEntry>>>,
     max_memory_entries: usize,
-    // Optional: Store original keys mapped to hashed filenames for debugging
-    key_mapping: Arc<RwLock<HashMap<String, String>>>,  // original -> hashed
 }
 
 impl TileCacheCore {
@@ -204,8 +205,7 @@ impl TileCacheCore {
             cache_path,
             statistics: Arc::new(CacheStatistics::new()),
             memory_cache: Arc::new(RwLock::new(HashMap::with_capacity(1000))),
-            max_memory_entries: 1000,  // Configurable memory cache size
-            key_mapping: Arc::new(RwLock::new(HashMap::with_capacity(1000))),
+            max_memory_entries: 1000,
         })
     }
 
@@ -215,46 +215,63 @@ impl TileCacheCore {
         let tile_path = self.tile_path(&hashed_key);
         let meta_path = self.meta_path(&hashed_key);
 
-        // Store the mapping for debugging
-        if let Ok(mut mapping) = self.key_mapping.write() {
-            mapping.insert(cache_key.to_string(), hashed_key.clone());
-        }
+        // Write both tile and meta to .tmp files first, then rename in order.
+        // The .meta rename is the final atomic commit step: load_tile checks
+        // for .meta before reading the .tile, so making .meta the last rename
+        // guarantees a reader never sees a valid .meta without a valid .tile.
+        //
+        // Crash scenarios:
+        //   Before .tile rename  → neither file live → cache miss (safe)
+        //   After  .tile rename,
+        //   before .meta rename  → orphaned .tile, no .meta → cache miss (safe)
+        //   After  both renames  → consistent pair (normal)
+        //
+        // Construct tmp paths directly so extensions are ".tile.tmp" / ".meta.tmp"
+        // rather than ".tmp.tile" / ".tmp.meta".  tile_path() always appends
+        // ".tile", which would make the temp file indistinguishable from a real
+        // entry and cause tile_count() / clear_expired() to count it.
+        let tmp_tile_path = self.cache_path.join(format!("{}.tile.tmp", hashed_key));
+        let tmp_meta_path = self.cache_path.join(format!("{}.meta.tmp", hashed_key));
 
-        // Write tile data with buffered writer for better performance
+        // 1. Write tile data to tmp.
         {
-            let file = fs::File::create(&tile_path)?;
+            let file = fs::File::create(&tmp_tile_path)?;
             let mut writer = BufWriter::with_capacity(64 * 1024, file);
             writer.write_all(data)?;
             writer.flush()?;
         }
 
-        // Prepend a version byte so future TileMeta layout changes can be
-        // detected on read rather than silently producing garbage data.
+        // 2. Write metadata to tmp. Prepend a version byte so future TileMeta
+        //    layout changes can be detected on read rather than producing garbage.
         const META_VERSION: u8 = 1;
         let meta_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("rkyv serialization error: {}", e)))?;
         let mut versioned = Vec::with_capacity(1 + meta_bytes.len());
         versioned.push(META_VERSION);
         versioned.extend_from_slice(&meta_bytes);
+        if let Err(e) = fs::write(&tmp_meta_path, &versioned) {
+            let _ = fs::remove_file(&tmp_tile_path);
+            return Err(e);
+        }
 
-        fs::write(&meta_path, &versioned)?;
+        // 3. Rename tile (not yet observable — no .meta yet).
+        if let Err(e) = fs::rename(&tmp_tile_path, &tile_path) {
+            let _ = fs::remove_file(&tmp_tile_path);
+            let _ = fs::remove_file(&tmp_meta_path);
+            return Err(e);
+        }
+
+        // 4. Rename meta — this is the atomic commit point.
+        if let Err(e) = fs::rename(&tmp_meta_path, &meta_path) {
+            // .tile was renamed but .meta failed. Remove the orphaned .tile so
+            // the cache directory stays consistent.
+            let _ = fs::remove_file(&tile_path);
+            let _ = fs::remove_file(&tmp_meta_path);
+            return Err(e);
+        }
 
         // Update memory cache
-        if let Ok(mut cache) = self.memory_cache.write() {
-            // Evict old entries if at capacity
-            if cache.len() >= self.max_memory_entries {
-                self.evict_lru_from_memory(&mut cache);
-            }
-
-            cache.insert(
-                cache_key.to_string(),
-                MemoryCacheEntry {
-                    data: Arc::new(data.to_vec()),
-                    meta: *meta,
-                    last_access: Arc::new(AtomicI64::new(current_timestamp())),
-                },
-            );
-        }
+        self.insert_into_memory_cache(cache_key, Arc::new(data.to_vec()), *meta);
 
         Ok(())
     }
@@ -307,6 +324,13 @@ impl TileCacheCore {
             let _ = fs::remove_file(tile_path);
             let _ = fs::remove_file(meta_path);
             return None;
+        }
+
+        // Negative cache entries have no .tile file — return empty data directly.
+        if meta.is_negative {
+            self.insert_into_memory_cache(cache_key, Arc::new(Vec::new()), meta);
+            self.statistics.record_disk_hit();
+            return Some(CachedTile { data: vec![], meta });
         }
 
         // Load tile data
@@ -379,11 +403,6 @@ impl TileCacheCore {
         let hashed_key = self.hash_cache_key(cache_key);
         let meta_path = self.meta_path(&hashed_key);
 
-        // Store the mapping for debugging
-        if let Ok(mut mapping) = self.key_mapping.write() {
-            mapping.insert(cache_key.to_string(), hashed_key);
-        }
-
         // Serialize metadata with rkyv (versioned — see save_tile)
         const META_VERSION: u8 = 1;
         let meta_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&meta)
@@ -395,20 +414,7 @@ impl TileCacheCore {
         fs::write(&meta_path, &versioned)?;
 
         // Update memory cache with empty data
-        if let Ok(mut cache) = self.memory_cache.write() {
-            if cache.len() >= self.max_memory_entries {
-                self.evict_lru_from_memory(&mut cache);
-            }
-
-            cache.insert(
-                cache_key.to_string(),
-                MemoryCacheEntry {
-                    data: Arc::new(Vec::new()),
-                    meta,
-                    last_access: Arc::new(AtomicI64::new(current_timestamp())),
-                },
-            );
-        }
+        self.insert_into_memory_cache(cache_key, Arc::new(Vec::new()), meta);
 
         Ok(())
     }
@@ -429,11 +435,6 @@ impl TileCacheCore {
         let _ = fs::remove_file(tile_path);
         let _ = fs::remove_file(meta_path);
 
-        // Remove from key mapping
-        if let Ok(mut mapping) = self.key_mapping.write() {
-            mapping.remove(cache_key);
-        }
-
         Ok(())
     }
 
@@ -442,11 +443,6 @@ impl TileCacheCore {
         // Clear memory cache
         if let Ok(mut cache) = self.memory_cache.write() {
             cache.clear();
-        }
-
-        // Clear key mapping
-        if let Ok(mut mapping) = self.key_mapping.write() {
-            mapping.clear();
         }
 
         // Delete all files in cache directory
@@ -467,16 +463,12 @@ impl TileCacheCore {
     pub fn clear_expired(&self) -> io::Result<u64> {
         let mut cleared_count = 0u64;
 
-        // Clear from memory cache
+        // Clear from memory cache — do NOT count these towards cleared_count.
+        // The disk scan below is the authoritative source of truth; counting
+        // memory evictions separately would double-count tiles that exist in both.
         if let Ok(mut cache) = self.memory_cache.write() {
             let now = current_timestamp();
-            cache.retain(|_, entry| {
-                let expired = entry.meta.expiration < now;
-                if expired {
-                    cleared_count += 1;
-                }
-                !expired
-            });
+            cache.retain(|_, entry| entry.meta.expiration >= now);
         }
 
         // Clear from disk
@@ -490,7 +482,7 @@ impl TileCacheCore {
                     if let Some(meta) = self.load_metadata_internal(&path) {
                         if meta.is_expired() {
                             // Delete both .meta and .tile files
-                            let stem = path.file_stem().unwrap();
+                            let Some(stem) = path.file_stem() else { continue };
                             let tile_path = self.cache_path.join(format!("{}.tile", stem.to_string_lossy()));
 
                             let _ = fs::remove_file(&path);
@@ -548,7 +540,6 @@ impl TileCacheCore {
     /// Evict least recently used entry from memory cache.
     ///
     /// Called while the write lock on `memory_cache` is already held.
-    /// Also purges the evicted key from `key_mapping` to prevent unbounded growth.
     fn evict_lru_from_memory(&self, cache: &mut HashMap<String, MemoryCacheEntry>) {
         if cache.is_empty() {
             return;
@@ -569,10 +560,24 @@ impl TileCacheCore {
 
         if let Some(key) = oldest_key {
             cache.remove(&key);
-            // Purge from key_mapping to prevent unbounded memory growth.
-            if let Ok(mut mapping) = self.key_mapping.write() {
-                mapping.remove(&key);
+        }
+    }
+
+    /// Acquire the memory-cache write lock, evict an entry if at capacity,
+    /// then insert `(cache_key, data, meta)` as a new `MemoryCacheEntry`.
+    fn insert_into_memory_cache(&self, cache_key: &str, data: Arc<Vec<u8>>, meta: TileMeta) {
+        if let Ok(mut cache) = self.memory_cache.write() {
+            if cache.len() >= self.max_memory_entries {
+                self.evict_lru_from_memory(&mut cache);
             }
+            cache.insert(
+                cache_key.to_string(),
+                MemoryCacheEntry {
+                    data,
+                    meta,
+                    last_access: Arc::new(AtomicI64::new(current_timestamp())),
+                },
+            );
         }
     }
 
@@ -653,17 +658,6 @@ impl TileCacheCore {
     /// Set max memory cache entries
     pub fn set_max_memory_entries(&mut self, max_entries: usize) {
         self.max_memory_entries = max_entries;
-    }
-
-    /// Debug helper: Get original key from hashed filename
-    pub fn get_original_key(&self, hashed_key: &str) -> Option<String> {
-        if let Ok(mapping) = self.key_mapping.read() {
-            mapping.iter()
-                .find(|(_, v)| v.as_str() == hashed_key)
-                .map(|(k, _)| k.clone())
-        } else {
-            None
-        }
     }
 
     // MARK: - Statistics Recording Methods (for API compatibility)
