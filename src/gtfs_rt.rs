@@ -301,7 +301,7 @@ pub struct Translation {
     /// UTF-8 text content (Required).
     #[prost(string, required, tag = "1")]
     pub text: String,
-    /// BCP-47 language code (e.g. "en", "fr").  May be absent if the feed
+    /// BCP-47 language code may be absent if the feed
     /// is monolingual and does not tag its translations.
     #[prost(string, optional, tag = "2")]
     pub language: Option<String>,

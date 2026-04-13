@@ -255,20 +255,12 @@ impl TileCacheCore {
         }
 
         // 3. Rename tile (not yet observable — no .meta yet).
-        if let Err(e) = fs::rename(&tmp_tile_path, &tile_path) {
-            let _ = fs::remove_file(&tmp_tile_path);
-            let _ = fs::remove_file(&tmp_meta_path);
-            return Err(e);
-        }
+        atomic_rename(&tmp_tile_path, &tile_path, &[&tmp_tile_path, &tmp_meta_path])?;
 
         // 4. Rename meta — this is the atomic commit point.
-        if let Err(e) = fs::rename(&tmp_meta_path, &meta_path) {
-            // .tile was renamed but .meta failed. Remove the orphaned .tile so
-            // the cache directory stays consistent.
-            let _ = fs::remove_file(&tile_path);
-            let _ = fs::remove_file(&tmp_meta_path);
-            return Err(e);
-        }
+        // .tile was renamed but .meta failed. Remove the orphaned .tile so
+        // the cache directory stays consistent.
+        atomic_rename(&tmp_meta_path, &meta_path, &[&tile_path, &tmp_meta_path])?;
 
         // Update memory cache
         self.insert_into_memory_cache(cache_key, Arc::new(data.to_vec()), *meta);
@@ -702,6 +694,18 @@ fn current_timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Rename `src` to `dst`. On failure, attempt to remove every path in
+/// `cleanup` (ignoring individual remove errors) and return the rename error.
+fn atomic_rename(src: &Path, dst: &Path, cleanup: &[&Path]) -> io::Result<()> {
+    if let Err(e) = fs::rename(src, dst) {
+        for path in cleanup {
+            let _ = fs::remove_file(path);
+        }
+        return Err(e);
+    }
+    Ok(())
 }
 
 // MARK: - Tests

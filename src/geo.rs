@@ -1,6 +1,6 @@
 //! geo.rs — shared geodesic geometry helpers
 //!
-//! Centralises the Haversine distance formula used by both `stops_db`
+//! Centralizes the Haversine distance formula used by both `stops_db`
 //! (radius queries) and `gtfs_static` (shape-timeline construction).
 //! All functions are `pub(crate)` — they are not part of the FFI surface.
 

@@ -464,7 +464,7 @@ fn day_of_week_from_yyyymmdd(yyyymmdd: u32) -> u8 {
     static T: [i32; 12] = [0,3,2,5,0,3,5,1,4,6,2,4];
     // Guard against invalid YYYYMMDD (month 0 or >12) — T[(m0-1)] would be OOB.
     // In normal operation m0 is always 1-12 (from local_midnight_to_yyyymmdd),
-    // but defence-in-depth prevents UB if ever called with raw user data.
+    // but defense-in-depth prevents UB if ever called with raw user data.
     if m0 < 1 || m0 > 12 { return 0; }
     let y = if m0 < 3 { y0 - 1 } else { y0 };
     ((y + y/4 - y/100 + y/400 + T[(m0-1) as usize] + d) % 7) as u8
@@ -827,7 +827,7 @@ fn parse_routes(data: &[u8]) -> Result<(HashMap<String, String>, HashMap<String,
         let long  = route_long_idx.and_then(|i| record.get(i)).unwrap_or("").trim().to_string();
         // Display name: prefer short if non-empty, fall back to long.
         // Per best practices, route_long_name should not repeat route_short_name
-        // but we just pick the most useful non-empty value for display.
+        // , but we just pick the most useful non-empty value for display.
         let display = if !short.is_empty() { short.clone() } else { long };
         if !display.is_empty() {
             display_names.insert(route_id.clone(), display);
@@ -1239,7 +1239,7 @@ fn ranges_to_ffi(ranges: Vec<(String, u64, u64)>, out_count: *mut usize) -> *mut
     let count = out.len();
     unsafe { *out_count = count };
     // Use into_boxed_slice so capacity == length; capacity mismatch in the
-    // corresponding free function would be undefined behaviour.
+    // corresponding free function would be undefined behavior.
     let mut boxed: Box<[GTFSZipRange]> = out.into_boxed_slice();
     let ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
@@ -1606,7 +1606,7 @@ pub extern "C" fn gtfs_static_store_get_service_id(
 }
 
 /// Returns 1 if calendar.txt or calendar_dates.txt data has been loaded for `store_id`.
-/// Returns 0 when the store has no service-day data (is_trip_active will pass-through).
+/// Returns 0 when the store has no service-day data (is_trip_active will pass through).
 #[no_mangle]
 pub extern "C" fn gtfs_static_store_calendar_loaded(store_id: u32) -> i32 {
     let Some(handle) = get_store(store_id) else { return 0 };

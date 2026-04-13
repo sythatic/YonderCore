@@ -158,7 +158,7 @@ impl StopsDatabase {
     }
 
     /// Rebuild the spatial index using `bulk_load` for an optimally balanced
-    /// R-tree.  Call this once after loading all feeds to amortise the cost of
+    /// R-tree.  Call this once after loading all feeds to amortize the cost of
     /// incremental insertions done by repeated [`load_from_csv`][Self::load_from_csv]
     /// calls.
     pub fn rebuild_spatial_index(&self) -> Result<(), String> {
@@ -358,7 +358,7 @@ fn parse_providers(input: &str) -> Vec<String> {
 }
 
 /// Trim a CSV field and return `Some(owned_string)` when non-empty, `None` otherwise.
-/// Eliminates the repeated inline `and_then(|s| { let t = s.trim(); … })` pattern.
+/// Eliminates the repeated inline `and_then(|s| { let t = s.trim(); ...})` pattern.
 #[inline]
 fn nonempty_str(s: &str) -> Option<String> {
     let t = s.trim();
@@ -430,7 +430,7 @@ unsafe fn stops_to_c_string_array(
 
     *out_count = result.len();
     // Use into_boxed_slice so capacity == length; Vec::from_raw_parts with a
-    // mismatched capacity would be undefined behaviour in the free function.
+    // mismatched capacity would be undefined behavior in the free function.
     let mut boxed: Box<[*mut c_char]> = result.into_boxed_slice();
     let ptr = boxed.as_mut_ptr();
     std::mem::forget(boxed);
